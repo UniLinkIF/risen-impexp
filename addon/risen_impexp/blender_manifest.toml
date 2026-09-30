@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "risen_impexp"
+version = "0.9.0"
+name = "Risen ImpExp"
+tagline = "Risen 1 models, actors, motions, collision and ground"
+maintainer = "BlenderMod"
+type = "add-on"
+
+blender_version_min = "5.1.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+tags = ["Import-Export"]
+
+[permissions]
+files = "Reads the Risen game archives and writes mod packages"

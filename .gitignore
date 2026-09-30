@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.zip
+core/target/
+dist/
+core/formats/target/

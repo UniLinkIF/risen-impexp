@@ -1,0 +1,17 @@
+[package]
+name = "risen-core"
+version = "0.1.0"
+edition = "2021"
+description = "Native core of the Risen ImpExp Blender add-on: reads Risen 1 archives and formats"
+
+[dependencies]
+risen_formats = { path = "formats", package = "risen-formats" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "bmp"] }
+texpresso = "2"
+gltf = { version = "1", default-features = false, features = ["utils", "names"] }
+
+[profile.release]
+opt-level = 3

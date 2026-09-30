@@ -1,0 +1,16 @@
+[package]
+name = "risen-formats"
+version = "0.1.0"
+edition = "2021"
+description = "Risen 1 file formats for Risen ImpExp"
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "risen_formats"
+
+[dependencies]
+anyhow = "1"
+flate2 = "1"
+ddsfile = { version = "0.6.0", default-features = false }
+texpresso = { version = "2.0.2", default-features = false }
+serde = { version = "1", features = ["derive"] }
