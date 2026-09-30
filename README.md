@@ -44,7 +44,7 @@ object placements.
 ## Install
 
 1. Blender 5.1 or newer.
-2. *Edit → Preferences → Get Extensions → ⌄ → Install from Disk…* → `risen_impexp-0.9.0.zip`
+2. *Edit → Preferences → Get Extensions → ⌄ → Install from Disk…* → `risen_impexp-0.9.1.zip`
    (from the Releases page).
 3. In the add-on's preferences set **Risen game folder** (the one with `bin\Risen.exe`; the Steam
    default is filled in). Optional: a cache folder and a folder for mod packages.

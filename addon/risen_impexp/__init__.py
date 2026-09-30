@@ -12,7 +12,7 @@ Works both as a legacy add-on (bl_info) and as a Blender 5.x extension
 bl_info = {
     "name": "Risen ImpExp",
     "author": "BlenderMod",
-    "version": (0, 9, 0),
+    "version": (0, 9, 1),
     "blender": (5, 1, 0),
     "location": "File > Import / Export > Risen",
     "description": "Import and export Risen 1 models, actors, motions, collision and ground",

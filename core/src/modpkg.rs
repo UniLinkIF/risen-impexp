@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 
 fn win(rel: &str) -> String { rel.replace('/', "\\") }
 
+/// A path as it stands in a batch file: `%` starts a variable there (clip names carry `_%_`), so it is doubled.
+fn bat(rel: &str) -> String { win(rel).replace('%', "%%") }
+
 pub fn write_package(g: &GameCtx, dir: &Path, title: &str, files: &[(String, Vec<u8>)]) -> Result<Vec<String>> {
     let fdir = dir.join("files");
     if fdir.exists() { std::fs::remove_dir_all(&fdir).with_context(|| format!("clear {}", fdir.display()))?; }
@@ -25,7 +28,7 @@ pub fn write_package(g: &GameCtx, dir: &Path, title: &str, files: &[(String, Vec
     let dirs = export::directories(g, files, false, |rel| file_mtime(&fdir.join(rel)))?;
     export::write_all(&fdir, &dirs)?;
     let all: Vec<String> = files.iter().chain(&dirs).map(|(p, _)| p.clone()).collect();
-    let list = all.iter().map(|p| format!("\"{}\"", win(p))).collect::<Vec<_>>().join(" ");
+    let list = all.iter().map(|p| format!("\"{}\"", bat(p))).collect::<Vec<_>>().join(" ");
     std::fs::write(dir.join("INSTALL.bat"), INSTALL.replace("{TITLE}", title).replace("{FILES}", &list).replace('\n', "\r\n"))?;
     std::fs::write(dir.join("ROLLBACK.bat"), ROLLBACK.replace("{TITLE}", title).replace("{FILES}", &list).replace('\n', "\r\n"))?;
     std::fs::write(dir.join("README.txt"), README.replace("{TITLE}", title).replace("{FILES}", &all.iter().map(|p| format!("  {}", win(p))).collect::<Vec<_>>().join("\r\n")).replace('\n', "\r\n"))?;
@@ -191,4 +194,27 @@ pub fn installed(g: &GameCtx) -> Result<Vec<(String, Vec<String>)>> { Ok(load(g)
 fn is_running() -> bool {
     std::process::Command::new("tasklist").args(["/FI", "IMAGENAME eq Risen.exe", "/NH"]).output()
         .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("risen.exe")).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    /// A clip name with `%` survives the installer: the batch file doubles it, cmd reads it back once.
+    #[cfg(windows)]
+    #[test]
+    fn installer_copies_names_with_percent() {
+        let root = std::env::temp_dir().join(format!("rc-pct-{}", std::process::id()));
+        let (pkg, game) = (root.join("pkg"), root.join("Program Files (x86)").join("Risen"));
+        std::fs::create_dir_all(game.join("bin")).unwrap();
+        std::fs::write(game.join("bin").join("Risen.exe"), b"stub").unwrap();
+        std::fs::write(game.join("bin").join("mountlist_packed.ini"), b"NoPhysical=false\r\n").unwrap();
+        let rel = "data/compiled/animations/Hero_Stand_None_None_P0_Ambient_Loop_N_Fwd_00_%_00_P0_0._xmot";
+        std::fs::create_dir_all(pkg.join("files").join("data/compiled/animations")).unwrap();
+        std::fs::write(pkg.join("files").join(rel), b"clip").unwrap();
+        let list = format!("\"{}\"", super::bat(rel));
+        std::fs::write(pkg.join("INSTALL.bat"), super::INSTALL.replace("{TITLE}", "t").replace("{FILES}", &list).replace('\n', "\r\n")).unwrap();
+        let out = std::process::Command::new("cmd").arg("/c").arg(pkg.join("INSTALL.bat")).arg(&game).stdin(std::process::Stdio::null()).output().unwrap();
+        let installed = game.join(rel).is_file();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(installed, "not installed:\n{}", String::from_utf8_lossy(&out.stdout));
+    }
 }
