@@ -132,7 +132,7 @@ def _default_name(context):
 
 class RISEN_OT_export_mesh(bpy.types.Operator):
     bl_idname = "risen.export_mesh"
-    bl_label = "Risen Mesh → Mod (._xmsh)"
+    bl_label = "Risen Model → Mod (._xmsh)"
     bl_description = "Виділені об'єкти → модель Risen: замінити наявну (та сама назва) або додати нову; пакет мода або встановлення в гру"
 
     name: StringProperty(name="Назва моделі", description="Назва ._xmsh у грі. Наявна назва — заміна (напр. It_Wpn_2H_Berserk), нова — додати")
@@ -175,6 +175,11 @@ class RISEN_OT_export_mesh(bpy.types.Operator):
         # Objects named *_COL are the collision shape, the rest the model.
         col_objects = [o for o in selected if "_col" in o.name.lower()]
         objects = [o for o in selected if o not in col_objects]
+        # A model imported with its collision carries it as a *_COL child: it goes along unselected.
+        for o in objects:
+            for c in o.children_recursive:
+                if c.type == "MESH" and "_col" in c.name.lower() and c not in col_objects:
+                    col_objects.append(c)
         if not objects or not self.name:
             self.report({"ERROR"}, "Виділіть меш і вкажіть назву моделі")
             return {"CANCELLED"}

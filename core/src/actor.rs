@@ -2,8 +2,9 @@
 //!
 //! glTF is right-handed Y up, so the game (left-handed Y up) is
 //! mirrored in Z — positions/normals/bone translations `(x, y, -z)`, bone rotations
-//! `(-x, -y, z, w)` — the same rule as the static-mesh OBJ. One mirror turns Direct3D's clockwise
-//! faces into glTF's counter-clockwise, so triangles keep their file order. glTF's UV origin is
+//! `(-x, -y, z, w)` — the same rule as the static-mesh OBJ. Unlike `._xmsh`, an actor's skin stores
+//! its faces counter-clockwise against its normals (5714 of 5744 wolf faces), so after the mirror
+//! each triangle is written reversed, (0, 2, 1), to face along its normals in glTF. glTF's UV origin is
 //! top-left like Direct3D: V as stored. Centimetres → metres here (glTF is metric).
 //! Inverse bind matrices come from the converted bind pose, so skin(bind) = identity.
 
@@ -140,6 +141,9 @@ impl ClipIndex {
 
     /// The idle loop: humans stand in `Hero_Stand_None_None_P0_Ambient_Loop…`, creatures in
     /// `<Creature>_Stand_None_None_P0_Ambient_Loop…`, else any `<Creature>_…Ambient_Loop…`.
+    /// (clip name, entry) of a body clip by name.
+    pub fn get(&self, clip: &str) -> Option<(String, String)> { self.by_stem.get(&clip.to_lowercase()).cloned() }
+
     pub fn idle_for(&self, actor_stem: &str) -> Option<(String, String)> {
         let t = Self::token(actor_stem)?;
         let exact = format!("{t}_stand_none_none_p0_ambient_loop");
@@ -202,7 +206,7 @@ pub fn build_glb(name: &str, nodes: &[SkeletonNode], parts: &[Part], anims: &[(S
         let a_j = bin.acc(&js, Some(34962), 5123, nv, "VEC4", None);
         let a_w = bin.f32s(&ws, Some(34962), "VEC4", false);
         for (mi, m) in mesh.materials.iter().enumerate() {
-            let idx: Vec<u8> = mesh.faces.iter().zip(&mesh.face_material_ids).filter(|(_, id)| **id as usize == mi).flat_map(|(f, _)| f.iter().flat_map(|i| i.to_le_bytes())).collect();
+            let idx: Vec<u8> = mesh.faces.iter().zip(&mesh.face_material_ids).filter(|(_, id)| **id as usize == mi).flat_map(|(f, _)| [f[0], f[2], f[1]].into_iter().flat_map(|i| i.to_le_bytes())).collect();
             if idx.is_empty() { continue; }
             let count = idx.len() / 4;
             tris += count / 3;
@@ -340,6 +344,8 @@ pub fn pick_clips(clips: &ClipIndex, actor: &str, query: &str, limit: usize) -> 
     match query.trim() {
         "*" => vec![],
         "" => clips.idle_for(actor).into_iter().collect(),
+        // "@<file>": exactly the clips named in that file, one per line.
+        q if q.starts_with('@') => std::fs::read_to_string(&q[1..]).unwrap_or_default().lines().filter_map(|n| clips.get(n.trim())).take(limit).collect(),
         q => clips.for_actor(actor, q).into_iter().take(limit).collect(),
     }
 }

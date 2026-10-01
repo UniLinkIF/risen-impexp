@@ -58,7 +58,7 @@ class RISEN_PT_main(bpy.types.Panel):
     def draw(self, context):
         col = self.layout.column(align=True)
         col.operator("risen.import_mesh", icon="IMPORT")
-        col.operator("risen.import_actor", icon="ARMATURE_DATA")
+        col.operator("risen.import_character", icon="ARMATURE_DATA")
         col.operator("risen.import_motion", icon="ACTION")
         col.operator("risen.import_world", icon="WORLD")
         col.operator("risen.import_landscape", icon="MESH_GRID")

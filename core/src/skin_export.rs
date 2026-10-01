@@ -231,7 +231,20 @@ fn read_input(spec: &ActorSpec) -> Result<SkinInput> {
     let o = o + n / 3 * 4;
     let weights = (0..v).map(|i| [0, 1, 2, 3].map(|k| (ul(o + i * 32 + k * 8), fl(o + i * 32 + k * 8 + 4)))).collect();
     ensure!(corner_vertex.iter().all(|&c| (c as usize) < v), "corner refers past the vertices");
-    Ok(SkinInput { positions, corner_vertex, normals, uvs, tri_material, weights })
+    let mut s = SkinInput { positions, corner_vertex, normals, uvs, tri_material, weights };
+    to_skin_winding(&mut s);
+    Ok(s)
+}
+
+/// Blender's faces run counter-clockwise along their normals; an actor's skin stores them the other
+/// way round once mirrored into game space (see `actor.rs`), so every triangle swaps corners 1 and 2.
+fn to_skin_winding(s: &mut SkinInput) {
+    for t in 0..s.corner_vertex.len() / 3 {
+        let (a, b) = (t * 3 + 1, t * 3 + 2);
+        s.corner_vertex.swap(a, b);
+        s.normals.swap(a, b);
+        s.uvs.swap(a, b);
+    }
 }
 
 pub fn build(g: &crate::game::GameCtx, spec: &ActorSpec) -> Result<(ActorReport, Vec<(String, Vec<u8>)>)> {

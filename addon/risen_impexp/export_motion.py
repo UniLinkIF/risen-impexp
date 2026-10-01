@@ -13,7 +13,20 @@ import tempfile
 import bpy
 from bpy.props import EnumProperty, StringProperty
 
-from . import core
+from . import catalog, core
+from .import_actor import actor_clips
+
+
+def _search_clip(self, context, edit_text):
+    arm = context.active_object
+    actor = arm.get("risen_actor") if arm else None
+    if not actor:
+        return []
+    try:
+        q = edit_text.lower()
+        return [c for c in actor_clips(actor) if (self.category == catalog.ALL or catalog.clip_category(c) == self.category) and q in c.lower()][:300]
+    except core.CoreError:
+        return []
 from .prefs import prefs
 
 
@@ -22,7 +35,8 @@ class RISEN_OT_export_motion(bpy.types.Operator):
     bl_label = "Risen Motion (._xmot)"
     bl_description = "Активна анімація скелета Risen → кліп гри (заміна за тією ж назвою або новий)"
 
-    clip: StringProperty(name="Назва кліпу", description="Напр. Hero_Stand_None_None_P0_Move_Run_N_Fwd_00_%_00_P0_400 — заміна; нова назва — новий кліп")
+    category: EnumProperty(name="Категорія", items=catalog.CLIP_ENUM, description="Звузити список кліпів гри для заміни")
+    clip: StringProperty(name="Замінити кліп", description="Кліп гри, який замінить ця анімація (наприклад стійка, хода, атака); нова назва — новий кліп, який гра сама не викличе", search=_search_clip)
     mode: EnumProperty(name="Куди", items=(
         ("install", "Встановити в гру", "Одразу в папку гри; прибрати — панель Risen"),
         ("package", "Пакет мода", "Папка з files/, INSTALL.bat і ROLLBACK.bat"),
@@ -37,11 +51,14 @@ class RISEN_OT_export_motion(bpy.types.Operator):
 
     def invoke(self, context, event):
         if not self.clip:
-            self.clip = context.active_object.animation_data.action.name.split(".")[0]
+            act = context.active_object.animation_data.action
+            self.clip = act.get("risen_clip") or act.name.split(".")[0]
+            self.category = catalog.clip_category(self.clip)
         return context.window_manager.invoke_props_dialog(self, width=560)
 
     def draw(self, context):
         col = self.layout.column()
+        col.prop(self, "category")
         col.prop(self, "clip")
         col.prop(self, "mode", expand=True)
         if self.mode == "package":

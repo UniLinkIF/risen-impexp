@@ -11,14 +11,14 @@ collision and ground in **Blender 5.1+**.
 
 ## What it does
 
-**File → Import** (straight from the game's `.pak` archives, search by name):
+**File → Import** (straight from the game's `.pak` archives, search by name within a category):
 
 | Entry | Game files | Comes in as |
 |---|---|---|
-| Risen Mesh | `._xmsh` + `._xmat` + `._ximg` | mesh with diffuse and normal textures |
-| Risen Actor + Motions | `._xmac` + `._xmot` | armature, skinned mesh, one action per clip (humans get their head) |
-| Risen Motion onto the selected skeleton | `._xmot` | action on a Risen armature already in the scene |
-| Risen Collision | `._xcom` | wireframe mesh, surface materials as material names |
+| Risen Model | `._xmsh` + `._xmat` + `._ximg` | mesh with textures (vertices welded, uv/normal seams kept) and its collision as a wireframe `<name>_COL` child. Categories: buildings, locations, inventory items, decor and furniture, nature, trees and bushes (SpeedTree stand-ins), grass and undergrowth, water, technical |
+| Risen Character | `._xmac` | armature (bones as sticks) and skinned mesh, no animation. Categories: humans — body (with a head of your choice) or head, monsters, animated objects, items |
+| Risen Animations | `._xmot` | body animations onto the selected Risen skeleton: one clip or a whole category — idle, movement, attacks, defence, dialogue and gestures, sitting, sleeping, interaction, death |
+| Risen Collision | `._xcom` | only the collision, as a wireframe mesh |
 | Risen World Layer | `.lrent` | the placed objects of a layer, to build against |
 | Risen Landscape | `Levelmesh_Landscape_01` | the island's ground, to reshape |
 
@@ -26,8 +26,8 @@ collision and ground in **Blender 5.1+**.
 
 | Entry | Writes |
 |---|---|
-| Risen Mesh → Mod | `._xmsh`, new materials and textures, collision (`*_COL` objects or the mesh itself), the engine's resource directories |
-| Risen Motion | a `._xmot` clip — same name replaces a clip, a new name adds one |
+| Risen Model → Mod | `._xmsh`, new materials and textures, collision (the `*_COL` child or selected `*_COL` objects, else the mesh itself), the engine's resource directories |
+| Risen Motion | a `._xmot` clip replacing one of the game's, picked by category (by default the clip the action came from) |
 | Risen Actor | a `._xmac` — your mesh on a game skeleton (new armour, bodies), weights from vertex groups |
 | Risen Landscape | the ground patched in place, and the collision sectors under your edit |
 
@@ -44,7 +44,7 @@ object placements.
 ## Install
 
 1. Blender 5.1 or newer.
-2. *Edit → Preferences → Get Extensions → ⌄ → Install from Disk…* → `risen_impexp-0.9.1.zip`
+2. *Edit → Preferences → Get Extensions → ⌄ → Install from Disk…* → `risen_impexp-0.9.2.zip`
    (from the Releases page).
 3. In the add-on's preferences set **Risen game folder** (the one with `bin\Risen.exe`; the Steam
    default is filled in). Optional: a cache folder and a folder for mod packages.
@@ -57,14 +57,15 @@ original is kept) so the game reads loose files. Archives are never modified.
 
 ## Quick start
 
-- **Replace a sword:** Import → Risen Mesh → `It_Wpn_BS_RuneSword`. Edit it, keep the grip at the
-  origin (blade along +Z in game space, it shows as +Z up in Blender). Export → Risen Mesh → Mod,
+- **Replace a sword:** Import → Risen Model → `It_Wpn_BS_RuneSword`. Edit it, keep the grip at the
+  origin (blade along +Z in game space, it shows as +Z up in Blender). Export → Risen Model → Mod,
   same name, *Install*. Start the game.
-- **New armour:** Import → Risen Actor → `Ani_Hero_Armor_Player`, animations `*` (none). Sculpt or
+- **New armour:** Import → Risen Character → `Ani_Hero_Armor_Player`. Sculpt or
   replace the mesh, keep it skinned to the armature (vertex groups named after the bones).
   Export → Risen Actor, same name.
-- **Change an animation:** Import → Risen Actor → the creature, animations: a word from the clip
-  (`attack`). Edit the action, Export → Risen Motion with the clip's name.
+- **Change an animation:** Import → Risen Character → the creature, select its armature, Import →
+  Risen Animations → a category (say *Attacks*). Edit an action, Export → Risen Motion: the clip it
+  came from is preselected.
 - **Reshape ground:** Import → Risen Landscape, move vertices (proportional editing works well), do
   not add or delete any. Export → Risen Landscape.
 
@@ -76,6 +77,9 @@ Scale: Risen works in centimetres; the add-on imports at 0.01 (metres) and expor
   test, no specular maps yet.
 - Actor export replaces the base actor's mesh; morph targets (faces) are dropped, so heads cannot
   be replaced yet. The skeleton always comes from a game actor.
+- Facial animation (the dialogue lip-sync morphs) is not imported yet; body animations are.
+- Trees and bushes are SpeedTree recipes the game grows itself: they come in as stand-ins of the
+  right size and look, for building around, and are not written back.
 - Collision is written as triangle meshes (no convex hulls). Console (big-endian) files are not read.
 - A new model or actor shows in the game only once something places or references it (the editor).
 - Only the Steam/GOG PC version has been used (`risen-core` reads its `.pak` archives).

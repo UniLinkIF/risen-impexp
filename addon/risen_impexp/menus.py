@@ -4,7 +4,7 @@ import bpy
 
 IMPORTS = (
     "risen.import_mesh",
-    "risen.import_actor",
+    "risen.import_character",
     "risen.import_motion",
     "risen.import_collision",
     "risen.import_world",

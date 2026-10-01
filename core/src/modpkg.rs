@@ -5,7 +5,7 @@
 //!   It needs nothing but Windows. INSTALL refuses to overwrite a file it did not put there, so
 //!   two packages that both carry directories cannot silently undo each other.
 //! * **Install into this game** from Blender: every mod installed this way is listed in
-//!   `%LOCALAPPDATA%\RisenImpExp\installed.json`, and the directories are rebuilt from the
+//!   `%LOCALAPPDATA%\RisenImpExp\<hash of the canonical game folder>\installed.json`, and the directories are rebuilt from the
 //!   archive plus the files of *all* listed mods, so mods add up and uninstall cleanly.
 //!
 //! Both rely on the game reading loose files (`NoPhysical=false` in `bin\mountlist_packed.ini`).
@@ -110,26 +110,93 @@ const README: &str = "{TITLE}\n\nMade with Risen ImpExp (Blender add-on).\n\nIns
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct Registry { /// mod name → game-relative files (resources only; directories are derived)
-    mods: BTreeMap<String, Vec<String>>, dirs: Vec<String> }
+    mods: BTreeMap<String, Vec<String>>, dirs: Vec<String>,
+    /// The canonical game folder this registry belongs to (absent in registries before 0.9.2).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    root: String,
+    /// Directories another mod (an INSTALL.bat package) had already put in the game: loose path → our
+    /// saved copy of it. Our records are built on that copy instead of the archive, so its records
+    /// stay; when no mod of ours is left the copy goes back.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    bases: BTreeMap<String, String> }
 
-fn registry_path(g: &GameCtx) -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    let tag = format!("{:08x}", g.root.to_string_lossy().to_lowercase().bytes().fold(0x811c9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x01000193)));
-    base.join("RisenImpExp").join(tag).join("installed.json")
+fn fnv(s: &str) -> String { format!("{:08x}", s.bytes().fold(0x811c9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x01000193))) }
+
+/// One spelling per game folder: the registry is keyed by it, and the same folder reached as
+/// `C:/…/Risen`, `c:\…\RISEN\`, through `bin\Risen.exe` or an 8.3 name must find the SAME registry,
+/// or an install is "lost" and every later one refuses over its files.
+fn canonical_root(root: &Path) -> String {
+    let p = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let s = p.to_string_lossy().replace('/', "\\");
+    let s = if let Some(unc) = s.strip_prefix("\\\\?\\UNC\\") { format!("\\\\{unc}") } else { s.strip_prefix("\\\\?\\").unwrap_or(&s).to_string() };
+    s.trim_end_matches('\\').to_lowercase()
 }
 
-fn load(g: &GameCtx) -> Result<Registry> {
-    let p = registry_path(g);
-    if !p.is_file() { return Ok(Registry::default()); }
-    Ok(serde_json::from_slice(&std::fs::read(&p)?)?)
+fn registry_base() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("RisenImpExp")
 }
 
-fn save(g: &GameCtx, r: &Registry) -> Result<()> {
-    let p = registry_path(g);
+fn registry_path_in(base: &Path, root: &Path) -> PathBuf { base.join(fnv(&canonical_root(root))).join("installed.json") }
+
+/// Registries written before the key was canonical (hash of the root as spelled, lowercased): every
+/// spelling this game folder is likely to have been reached by.
+fn legacy_paths(base: &Path, root: &Path) -> Vec<PathBuf> {
+    let mut forms = vec![root.to_string_lossy().into_owned()];
+    if let Ok(c) = std::fs::canonicalize(root) { let c = c.to_string_lossy().into_owned(); forms.push(c.strip_prefix("\\\\?\\").unwrap_or(&c).to_string()); forms.push(c); }
+    let mut spellings = vec![];
+    for f in forms {
+        for s in [f.clone(), f.replace('/', "\\"), f.replace('\\', "/")] {
+            let t = s.trim_end_matches(['\\', '/']).to_string();
+            spellings.extend([t.clone(), format!("{t}\\"), format!("{t}/")]);
+        }
+    }
+    let new = registry_path_in(base, root);
+    let mut out: Vec<PathBuf> = spellings.into_iter().map(|s| base.join(fnv(&s.to_lowercase())).join("installed.json")).filter(|p| *p != new).collect();
+    // Also any registry that says (0.9.2+) it belongs to this folder.
+    let canon = canonical_root(root);
+    if let Ok(rd) = std::fs::read_dir(base) {
+        for e in rd.flatten() {
+            let p = e.path().join("installed.json");
+            if p == new || out.contains(&p) || !p.is_file() { continue; }
+            if let Ok(r) = serde_json::from_slice::<Registry>(&std::fs::read(&p).unwrap_or_default()) { if !r.root.is_empty() && canonical_root(Path::new(&r.root)) == canon { out.push(p); } }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The registry of `root` under `base`, adopting (merging, once) any registry an older spelling of
+/// the same folder left behind; the old file is renamed `installed.json.migrated`, not deleted.
+fn load_in(base: &Path, root: &Path) -> Result<Registry> {
+    let p = registry_path_in(base, root);
+    let mut reg: Registry = if p.is_file() { serde_json::from_slice(&std::fs::read(&p)?)? } else { Registry::default() };
+    let mut migrated = false;
+    for old in legacy_paths(base, root).into_iter().filter(|o| o.is_file()) {
+        let r: Registry = serde_json::from_slice(&std::fs::read(&old)?).with_context(|| format!("read {}", old.display()))?;
+        for (name, files) in r.mods {
+            let e = reg.mods.entry(name).or_default();
+            for f in files { if !e.contains(&f) { e.push(f); } }
+        }
+        for d in r.dirs { if !reg.dirs.contains(&d) { reg.dirs.push(d); } }
+        std::fs::rename(&old, old.with_extension("json.migrated")).with_context(|| format!("retire {}", old.display()))?;
+        migrated = true;
+    }
+    reg.root = canonical_root(root);
+    if migrated { save_in(base, root, &reg)?; }
+    Ok(reg)
+}
+
+fn save_in(base: &Path, root: &Path, r: &Registry) -> Result<()> {
+    let p = registry_path_in(base, root);
     std::fs::create_dir_all(p.parent().unwrap())?;
     std::fs::write(&p, serde_json::to_vec_pretty(r)?)?;
     Ok(())
 }
+
+fn load(g: &GameCtx) -> Result<Registry> { load_in(&registry_base(), &g.root) }
+
+fn save(g: &GameCtx, r: &Registry) -> Result<()> { save_in(&registry_base(), &g.root, r) }
 
 fn ensure_loose_files_read(root: &Path) -> Result<Option<String>> {
     let ini = root.join("bin").join("mountlist_packed.ini");
@@ -146,11 +213,32 @@ fn ensure_loose_files_read(root: &Path) -> Result<Option<String>> {
 fn sync_directories(g: &GameCtx, reg: &mut Registry) -> Result<()> {
     let mut all = vec![];
     for files in reg.mods.values() { for rel in files { all.push((rel.clone(), std::fs::read(g.root.join(rel)).with_context(|| format!("read installed {rel}"))?)); } }
-    let dirs = export::directories(g, &all, false, |rel| file_mtime(&g.root.join(rel)))?;
-    for old in &reg.dirs { if !dirs.iter().any(|(p, _)| p == old) { let _ = std::fs::remove_file(g.root.join(old)); } }
+    let bases = reg.bases.clone();
+    let base = |loose: &str| bases.get(loose).and_then(|copy| std::fs::read(copy).ok());
+    let dirs = export::directories_on(g, &all, &base, false, |rel| file_mtime(&g.root.join(rel)))?;
+    for old in &reg.dirs {
+        if dirs.iter().any(|(p, _)| p == old) { continue; }
+        // Ours no longer: an adopted directory goes back as it was, any other is removed.
+        match reg.bases.get(old) {
+            Some(copy) => { std::fs::copy(copy, g.root.join(old)).with_context(|| format!("restore {old}"))?; }
+            None => { let _ = std::fs::remove_file(g.root.join(old)); }
+        }
+    }
+    reg.bases.retain(|loose, _| dirs.iter().any(|(p, _)| p == loose));
     export::write_all(&g.root, &dirs)?;
     reg.dirs = dirs.into_iter().map(|(p, _)| p).collect();
     Ok(())
+}
+
+/// A directory another mod left in the game becomes the base ours are built on (see `Registry::bases`).
+fn adopt(g: &GameCtx, reg: &mut Registry, loose: &str) -> Result<String> {
+    let dir = registry_path_in(&registry_base(), &g.root).parent().unwrap().join("bases");
+    std::fs::create_dir_all(&dir)?;
+    let copy = dir.join(loose.replace(['/', '\\'], "__"));
+    std::fs::copy(g.root.join(loose), &copy).with_context(|| format!("keep a copy of {loose}"))?;
+    reg.bases.insert(loose.to_string(), copy.to_string_lossy().into_owned());
+    reg.dirs.push(loose.to_string());
+    Ok(format!("{loose} came from another mod: kept, and ours are added to it (its copy goes back when ours are removed)"))
 }
 
 pub fn install(g: &GameCtx, name: &str, files: &[(String, Vec<u8>)]) -> Result<Vec<String>> {
@@ -158,9 +246,10 @@ pub fn install(g: &GameCtx, name: &str, files: &[(String, Vec<u8>)]) -> Result<V
     let mut reg = load(g)?;
     let mut notes = vec![];
     let previous = reg.mods.remove(name).unwrap_or_default();
-    for (_, dir, loose) in crate::cache::DIRECTORIES {
+    for (_, _, loose) in crate::cache::DIRECTORIES {
         if g.root.join(loose).exists() && !reg.dirs.iter().any(|d| d == loose) {
-            bail!("{loose} already exists and was not made by Risen ImpExp (another mod owns the {dir} directory); remove that mod first");
+            let n = adopt(g, &mut reg, loose)?;
+            notes.push(n);
         }
     }
     for (rel, bytes) in files {
@@ -198,6 +287,41 @@ fn is_running() -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Every spelling of one game folder finds one registry, and a registry left under an old
+    /// (as-spelled) key is adopted once and retired. Temp folders only: never the real game.
+    #[test]
+    fn one_registry_per_game_folder_whatever_the_spelling() {
+        use std::path::Path;
+        let tmp = std::env::temp_dir().join(format!("rc-reg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (base, game) = (tmp.join("appdata"), tmp.join("Program Files (x86)").join("Risen"));
+        std::fs::create_dir_all(game.join("bin")).unwrap();
+        let s = game.to_string_lossy().into_owned();
+        let spellings = [s.clone(), s.replace('\\', "/"), format!("{s}\\"), s.to_uppercase(), game.join("bin").join("..").to_string_lossy().into_owned()];
+        let want = super::registry_path_in(&base, &game);
+        for sp in &spellings { assert_eq!(super::registry_path_in(&base, Path::new(sp)), want, "spelling {sp}"); }
+
+        // A 0.9.1 registry under the forward-slash spelling's old key, another under the as-is key.
+        let old = |sp: &str| base.join(super::fnv(&sp.to_lowercase())).join("installed.json");
+        let (o1, o2) = (old(&s.replace('\\', "/")), old(&format!("{s}\\")));
+        for (p, body) in [(&o1, r#"{"mods":{"Landscape":["data/a"]},"dirs":["data/d1"]}"#), (&o2, r#"{"mods":{"Landscape":["data/b"],"Sword":["data/c"]},"dirs":["data/d1"]}"#)] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        let r = super::load_in(&base, &game).unwrap();
+        // Old registries merge in path order, and the paths hash a temp folder named after the process.
+        let mut landscape = r.mods["Landscape"].clone();
+        landscape.sort();
+        assert_eq!(landscape, vec!["data/a".to_string(), "data/b".to_string()]);
+        assert_eq!(r.mods["Sword"], vec!["data/c".to_string()]);
+        assert_eq!(r.dirs, vec!["data/d1".to_string()]);
+        assert!(want.is_file() && !o1.is_file() && !o2.is_file(), "adopted registries must be saved under the new key and retired");
+        // Loading again through another spelling changes nothing.
+        let again = super::load_in(&base, Path::new(&s.replace('\\', "/"))).unwrap();
+        assert_eq!(again.mods, r.mods);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// A clip name with `%` survives the installer: the batch file doubles it, cmd reads it back once.
     #[cfg(windows)]
     #[test]

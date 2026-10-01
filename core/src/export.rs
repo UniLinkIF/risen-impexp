@@ -192,12 +192,18 @@ fn material_from_template(g: &GameCtx, stem: &str) -> Result<Vec<u8>> {
 /// The three resource directories: `base` (the archive's, or the game's current loose copy) with a
 /// record for every resource file in `files`. `mtime(path)` = the FILETIME the file will carry.
 pub fn directories(g: &GameCtx, files: &[(String, Vec<u8>)], from_loose: bool, mtime: impl Fn(&str) -> u64) -> Result<Vec<(String, Vec<u8>)>> {
+    directories_on(g, files, &|_| None, from_loose, mtime)
+}
+
+/// [`directories`], with `base(loose path)` able to supply the directory to build on (an adopted copy
+/// of another mod's directory) instead of the archive's.
+pub fn directories_on(g: &GameCtx, files: &[(String, Vec<u8>)], base: &dyn Fn(&str) -> Option<Vec<u8>>, from_loose: bool, mtime: impl Fn(&str) -> u64) -> Result<Vec<(String, Vec<u8>)>> {
     let mut out = vec![];
     for (suffix, entry, loose) in cache::DIRECTORIES {
         let mine: Vec<&(String, Vec<u8>)> = files.iter().filter(|(p, _)| p.to_lowercase().ends_with(suffix)).collect();
         if mine.is_empty() { continue; }
         let e = g.find_one(entry)?;
-        let base = if from_loose { g.read(&e)?.0 } else { g.read_archive(&e)? };
+        let base = match base(loose) { Some(b) => b, None => if from_loose { g.read(&e)?.0 } else { g.read_archive(&e)? } };
         let mut c = Cache::parse(&base).with_context(|| format!("parse {entry}"))?;
         for (p, bytes) in mine {
             let rname = p.rsplit('/').next().unwrap().split('.').next().unwrap();

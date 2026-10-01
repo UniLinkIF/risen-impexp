@@ -124,11 +124,14 @@ pub fn export_obj(g: &GameCtx, tex: &TextureIndex, name: &str, out: &Path) -> Re
     let mats: Vec<Material> = order.iter().map(|n| material(g, tex, n, out, &mut warnings)).collect::<Result<_>>()?;
 
     let mut obj = format!("# {entry}\nmtllib {stem}.mtl\n");
-    for p in &m.positions { writeln!(obj, "v {} {} {}", p[0], p[1], -p[2])?; }
+    // Vertices the file splits at uv / normal seams share one position in Blender (welded), while
+    // every corner keeps its own uv and normal (OBJ indexes them separately).
+    let (uniq, pos_of) = weld(&m.positions);
+    for p in &uniq { writeln!(obj, "v {} {} {}", p[0], p[1], -p[2])?; }
     for t in &m.uvs { writeln!(obj, "vt {} {}", t[0], 1.0 - t[1])?; }
     for n in &m.normals { writeln!(obj, "vn {} {} {}", n[0], n[1], -n[2])?; }
     let (has_uv, has_n) = (!m.uvs.is_empty(), !m.normals.is_empty());
-    let corner = |i: u32| { let k = i + 1; match (has_uv, has_n) { (true, true) => format!("{k}/{k}/{k}"), (true, false) => format!("{k}/{k}"), (false, true) => format!("{k}//{k}"), _ => k.to_string() } };
+    let corner = |i: u32| { let (v, k) = (pos_of[i as usize] + 1, i + 1); match (has_uv, has_n) { (true, true) => format!("{v}/{k}/{k}"), (true, false) => format!("{v}/{k}"), (false, true) => format!("{v}//{k}"), _ => v.to_string() } };
     let mut mtl = String::new();
     let mut triangles = 0;
     for (name, mat) in order.iter().zip(&mats) {
@@ -147,4 +150,12 @@ pub fn export_obj(g: &GameCtx, tex: &TextureIndex, name: &str, out: &Path) -> Re
     std::fs::write(&tmp, obj)?;
     std::fs::rename(&tmp, &obj_path)?;
     Ok(MeshOut { entry, obj: obj_path.to_string_lossy().into_owned(), vertices: m.positions.len(), triangles, materials: mats, warnings })
+}
+
+/// Positions welded by exact value, first appearance first: (unique positions, vertex → unique index).
+pub fn weld(pos: &[[f32; 3]]) -> (Vec<[f32; 3]>, Vec<u32>) {
+    let mut seen: HashMap<[u32; 3], u32> = HashMap::new();
+    let mut uniq = vec![];
+    let map = pos.iter().map(|p| *seen.entry(p.map(f32::to_bits)).or_insert_with(|| { uniq.push(*p); uniq.len() as u32 - 1 })).collect();
+    (uniq, map)
 }

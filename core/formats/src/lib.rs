@@ -11,3 +11,4 @@ pub mod xmesh_skin;
 pub mod xmot;
 pub mod ximg;
 pub mod xmsh;
+pub mod xspt;

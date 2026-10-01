@@ -9,8 +9,10 @@
 //! risen-core export-motion <game_dir> <spec.json> package <dir> [title] | install <mod>
 //! risen-core export-actor <game_dir> <spec.json> package <dir> [title] | install <mod>
 //! risen-core layers <game_dir> <query>  ·  world-layer <game_dir> <layer> <out_dir>
-//! risen-core landscape-get <game_dir> <out_dir>  ·  landscape-set <game_dir> <positions.bin> package <dir> | install <mod>
+//! risen-core landscape-get <game_dir> <out_dir> [current|archive]  ·  landscape-set <game_dir> <positions.bin> package <dir> | install <mod>
+//! risen-core landscape-set-paint <game_dir> <positions.bin> <paint.bin> package <dir> [title] | install <mod>   heights + ground materials
 //! risen-core uninstall <game_dir> <mod>  ·  risen-core installed <game_dir>
+//! risen-core trees <game_dir> <query>  ·  tree <game_dir> <name> <out_dir>   SpeedTree stand-ins
 //! risen-core actors <game_dir> <query> [limit]  ·  clips <game_dir> <actor> <query> [limit]
 //! risen-core actor <game_dir> <name> <out.glb> [clip query: "" idle, "*" none] [limit] [skeleton|full] [head|-]
 //! risen-core collision <game_dir> <mesh name|xcom> <out.obj>   a collision mesh for viewing
@@ -23,6 +25,7 @@ mod cache;
 mod cook;
 mod export;
 mod landscape;
+mod landscape_paint;
 mod modpkg;
 mod nxs;
 mod gr01;
@@ -33,6 +36,7 @@ mod ximg_write;
 mod xmot_write;
 mod xmac_write;
 mod skin_export;
+mod speedtree;
 mod terrain;
 mod terrain_col;
 #[allow(dead_code)]
@@ -68,6 +72,11 @@ fn run(args: &[String]) -> Result<serde_json::Value> {
             let limit = limit.map(str::parse).transpose().context("limit")?.unwrap_or(200);
             serde_json::to_value(find(&open_game(game)?, "._xmsh", q, limit))?
         }
+        (Some("tree"), Some(game), Some(name), Some(out)) => {
+            let g = open_game(game)?;
+            serde_json::to_value(speedtree::export_obj(&g, &mesh::TextureIndex::build(&g), name, Path::new(out))?)?
+        }
+        (Some("trees"), Some(game), Some(q), _) => serde_json::to_value(find(&open_game(game)?, "._xspt", q, 100000))?,
         (Some("actors"), Some(game), Some(q), limit) => {
             let limit = limit.map(str::parse).transpose().context("limit")?.unwrap_or(200);
             serde_json::to_value(find(&open_game(game)?, "._xmac", q, limit))?
@@ -170,15 +179,29 @@ usemtl {mat}
         }
         (Some("layers"), Some(game), Some(q), _) => serde_json::to_value(world::layers(&open_game(game)?, q))?,
         (Some("world-layer"), Some(game), Some(name), Some(out)) => serde_json::to_value(world::layer(&open_game(game)?, name, Path::new(out))?)?,
-        (Some("landscape-get"), Some(game), Some(out), _) => serde_json::to_value(landscape::get(&open_game(game)?, Path::new(out))?)?,
+        (Some("landscape-get"), Some(game), Some(out), which) => {
+            let current = match which { None | Some("archive") => false, Some("current") => true, Some(w) => bail!("landscape-get: {w}? use current or archive") };
+            serde_json::to_value(landscape::get(&open_game(game)?, Path::new(out), current)?)?
+        }
         (Some("landscape-set"), Some(game), Some(bin), Some(mode)) => {
             let g = open_game(game)?;
-            let (report, files) = landscape::set(&g, Path::new(bin))?;
+            let (report, files) = landscape::set(&g, Path::new(bin), None)?;
             let target = a(4).context("landscape-set: missing target")?;
             let done = match mode {
                 "package" => modpkg::write_package(&g, Path::new(target), a(5).unwrap_or("Landscape"), &files)?,
                 "install" => modpkg::install(&g, target, &files)?,
                 m => bail!("mode {m}: use package or install"),
+            };
+            serde_json::json!({ "report": report, "done": done })
+        }
+        (Some("landscape-set-paint"), Some(game), Some(bin), Some(paint)) => {
+            let g = open_game(game)?;
+            let (report, files) = landscape::set(&g, Path::new(bin), Some(Path::new(paint)))?;
+            let target = a(5).context("landscape-set-paint: missing target")?;
+            let done = match a(4) {
+                Some("package") => modpkg::write_package(&g, Path::new(target), a(6).unwrap_or("Landscape"), &files)?,
+                Some("install") => modpkg::install(&g, target, &files)?,
+                m => bail!("mode {m:?}: use package or install"),
             };
             serde_json::json!({ "report": report, "done": done })
         }
