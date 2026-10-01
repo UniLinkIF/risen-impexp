@@ -35,6 +35,8 @@ mod xmsh_write;
 mod ximg_write;
 mod xmot_write;
 mod xmac_write;
+mod morph;
+mod xpm;
 mod skin_export;
 mod speedtree;
 mod terrain;
@@ -86,6 +88,33 @@ fn run(args: &[String]) -> Result<serde_json::Value> {
             let limit = a(4).map(str::parse).transpose().context("limit")?.unwrap_or(500);
             let clips = actor::ClipIndex::build(&g);
             serde_json::to_value(clips.for_actor(&actor::stem(&actor::resolve_actor(&g, actor_name)?), q).into_iter().take(limit).map(|(n, _)| n).collect::<Vec<_>>())?
+        }
+        (Some("lipclips"), Some(game), Some(q), _) => {
+            let g = open_game(game)?;
+            let limit = a(3).map(str::parse).transpose().context("limit")?.unwrap_or(200);
+            let words: Vec<String> = q.to_lowercase().split_whitespace().map(String::from).collect();
+            serde_json::to_value(g.entries_with_suffix("._xmot").into_iter().filter(|e| e.starts_with("/infos/")).map(|e| actor::stem(&e))
+                .filter(|s| { let l = s.to_lowercase(); words.iter().all(|w| l.contains(w.as_str())) }).take(limit).collect::<Vec<_>>())?
+        }
+        (Some("lipsync"), Some(game), Some(head), Some(clip)) => {
+            // lipsync <game> <head actor> <clip> [cache dir]: weight keys per morph target, and the voice line as .mp3
+            let g = open_game(game)?;
+            let h = xmac_write::read(&g.read(&actor::resolve_actor(&g, head)?)?.0)?;
+            let body = h.sections.iter().find_map(|s| match s { xmac_write::Section::Raw { id: 12, body, .. } => Some(body), _ => None }).context("this head has no face shapes")?;
+            let targets: Vec<(String, u32)> = morph::read(body)?.targets.into_iter().map(|t| (t.name, t.phonemes)).collect();
+            let entry = g.find_one(&format!("/{}._xmot", clip.trim_end_matches("._xmot")))?;
+            let ls = xpm::read(&g.read(&entry)?.0)?;
+            let channels = xpm::for_targets(&ls, &targets);
+            let duration = ls.subs.iter().flat_map(|s| s.keys.last()).map(|k| k.0).fold(0f32, f32::max);
+            let mut sound = None;
+            if let (Some(dir), Ok(se)) = (a(4), g.find_one(&format!("{}._xsnd", entry.trim_end_matches("._xmot")))) {
+                let r = gr01::Resource::parse(&g.read(&se)?.0)?;
+                let p = Path::new(dir).join(format!("{}.mp3", actor::stem(&se)));
+                std::fs::create_dir_all(dir)?;
+                std::fs::write(&p, &r.data)?;
+                sound = Some(p.to_string_lossy().into_owned());
+            }
+            serde_json::json!({ "clip": actor::stem(&entry), "fps": ls.fps, "duration": duration, "sound": sound, "channels": channels })
         }
         (Some("actor"), Some(game), Some(name), Some(out)) => {
             let g = open_game(game)?;

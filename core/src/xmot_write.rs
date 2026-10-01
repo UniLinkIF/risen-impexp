@@ -168,7 +168,7 @@ mod tests {
             let names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
             let orig_bytes = g.read(&ce).unwrap().0;
             let orig = risen_formats::xmot::parse_motion(&orig_bytes, &names).unwrap();
-            let (glb, _) = actor::build_glb("t", &nodes, &[actor::Part { mesh: &mesh, joint_map: (0..nodes.len()).collect() }], &[(clip.clone(), orig.clone())], &mut |_, _| Ok(None)).unwrap();
+            let (glb, _) = actor::build_glb("t", &nodes, &[actor::Part { name: "t".into(), mesh: &mesh, joint_map: (0..nodes.len()).collect(), morphs: vec![] }], &[(clip.clone(), orig.clone())], &mut |_, _| Ok(None), &|_| (0, 0)).unwrap();
             let (_, tracks) = tracks_from_glb(&glb, &nodes, None).unwrap();
             let written = write_clip(&orig_bytes, &nodes, &tracks).unwrap();
             let back = risen_formats::xmot::parse_motion(&written, &names).unwrap();

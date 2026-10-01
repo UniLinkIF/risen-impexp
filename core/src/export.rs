@@ -22,6 +22,12 @@ pub struct MaterialSpec {
     pub name: String,
     pub diffuse: Option<String>,
     pub normal: Option<String>,
+    /// A specular (gloss) map: grey PNG, white = shiny.
+    #[serde(default)]
+    pub specular: Option<String>,
+    /// Alpha test: the cut-off (0..255) of the diffuse alpha; none = opaque.
+    #[serde(default)]
+    pub alpha_test: Option<u8>,
 }
 
 #[derive(serde::Deserialize)]
@@ -47,16 +53,25 @@ pub struct Report { pub files: Vec<String>, pub replaced: bool, pub collision: O
 /// The template material: diffuse + normal sampler, default shader. New materials copy it with
 /// their texture names swapped in; names keep the template's lengths because the shader data
 /// after the section carries its own offsets (not yet decoded), so nothing may shift.
-const TEMPLATE_MAT: &str = "ItWpn_SwordMisc_01_Diffuse_01";
-const TEMPLATE_STEM: &str = "ItWpn_SwordMisc_01";
+/// A game material new materials are copied from, with its texture names swapped for ours. Names
+/// keep the template's lengths because the shader data after the section carries its own offsets
+/// (not decoded), so nothing may shift.
+pub struct Template { pub material: &'static str, pub stem: &'static str, pub diffuse: &'static str, pub normal: &'static str, pub specular: Option<&'static str>, pub alpha_test: bool }
+
+/// Opaque, diffuse + normal (the weapon set's shader).
+pub const OPAQUE: Template = Template { material: "ItWpn_SwordMisc_01_Diffuse_01", stem: "ItWpn_SwordMisc_01", diffuse: "_Diffuse_01", normal: "_Normal_01", specular: None, alpha_test: false };
+/// Opaque with a specular map (the hero's hands).
+pub const OPAQUE_SPECULAR: Template = Template { material: "Ani_Hero_Armor_Hands_Diffuse_S1", stem: "Ani_Hero_Armor_Hands", diffuse: "_Diffuse_S1", normal: "_Normal_S1", specular: Some("_Specular_S1"), alpha_test: false };
+/// Alpha test (BlendMode 1; the cut-off is MaskReference) — the hero's cloth.
+pub const ALPHA_TEST: Template = Template { material: "Ani_Hero_Armor_Player_01_Cloth", stem: "Ani_Hero_Armor_Player_01_Cloth", diffuse: "_Diffuse_S1", normal: "_Normal_S1", specular: None, alpha_test: true };
 
 fn hash(s: &str) -> u64 { s.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3)) }
 
-/// An 18-character stem (the template's length): `BM_` + up to 10 letters of the name + `_` + hash.
-pub fn stem_for(name: &str) -> String {
-    let part: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).take(10).collect();
-    let n = TEMPLATE_STEM.len() - 4 - part.len();
-    format!("BM_{part}_{}", &format!("{:016x}", hash(name))[..n])
+/// A stem of exactly `len` characters: `BM_` + letters of the name + `_` + hash.
+pub fn stem_for(name: &str, len: usize) -> String {
+    let part: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).take(len.saturating_sub(8)).collect();
+    let n = len - 4 - part.len();
+    format!("BM_{part}_{}", &format!("{:032x}", (hash(name) as u128) << 64 | hash(&format!("{name}#")) as u128)[..n])
 }
 
 /// Blender adds `.001`-style suffixes to duplicated names; the game name is what came before.
@@ -114,8 +129,10 @@ pub fn build(g: &GameCtx, spec: &Spec) -> Result<Built> {
             report.materials.push(format!("{}: game material reused", m.name));
             continue;
         }
-        let stem = stem_for(&m.name);
-        let (tex_d, tex_n) = (format!("{stem}_Diffuse_01"), format!("{stem}_Normal_01"));
+        let t = if m.alpha_test.is_some() { &ALPHA_TEST } else if m.specular.is_some() { &OPAQUE_SPECULAR } else { &OPAQUE };
+        if m.alpha_test.is_some() && m.specular.is_some() { report.warnings.push(format!("material {}: alpha test and specular together has no game template; specular dropped", m.name)); }
+        let stem = stem_for(&m.name, t.stem.len());
+        let (tex_d, tex_n) = (format!("{stem}{}", t.diffuse), format!("{stem}{}", t.normal));
         let diffuse = match &m.diffuse {
             Some(p) => ximg_write::load_png(Path::new(p)).with_context(|| format!("material {}: diffuse {p}", m.name))?,
             None => { report.warnings.push(format!("material {}: no Base Color image, grey used", m.name)); (vec![128; 4 * 4 * 4], 4, 4) }
@@ -124,11 +141,18 @@ pub fn build(g: &GameCtx, spec: &Spec) -> Result<Built> {
             Some(p) => { let (px, w, h) = ximg_write::load_png(Path::new(p)).with_context(|| format!("material {}: normal {p}", m.name))?; (ximg_write::to_dxt5nm(&px), w, h) }
             None => (ximg_write::to_dxt5nm(&[128, 128, 255, 255].repeat(16)), 4, 4),
         };
-        files.push((format!("data/compiled/images/BlenderMod/{tex_d}._ximg"), ximg_write::write(&diffuse.0, diffuse.1, diffuse.2, Kind::Dxt1, now)?));
+        // Alpha-tested diffuse keeps its alpha (DXT5); opaque ones need none (DXT1).
+        let dk = if t.alpha_test { Kind::Dxt5 } else { Kind::Dxt1 };
+        files.push((format!("data/compiled/images/BlenderMod/{tex_d}._ximg"), ximg_write::write(&diffuse.0, diffuse.1, diffuse.2, dk, now)?));
         files.push((format!("data/compiled/images/BlenderMod/{tex_n}._ximg"), ximg_write::write(&normal.0, normal.1, normal.2, Kind::Dxt5, now)?));
-        files.push((format!("data/common/materials/{tex_d}._xmat"), material_from_template(g, &stem)?));
+        if let (Some(suffix), Some(p)) = (t.specular, &m.specular) {
+            let (px, w, h) = ximg_write::load_png(Path::new(p)).with_context(|| format!("material {}: specular {p}", m.name))?;
+            files.push((format!("data/compiled/images/BlenderMod/{stem}{suffix}._ximg"), ximg_write::write(&px, w, h, Kind::Dxt1, now)?));
+        }
+        files.push((format!("data/common/materials/{tex_d}._xmat"), material_from_template(g, t, &stem, m.alpha_test)?));
         mat_names.push(format!("{tex_d}._xmat"));
-        report.materials.push(format!("{}: new material {tex_d} ({}×{})", m.name, diffuse.1, diffuse.2));
+        let kind = if t.alpha_test { "alpha test" } else if t.specular.is_some() { "specular" } else { "opaque" };
+        report.materials.push(format!("{}: new material {tex_d} ({}×{}, {kind})", m.name, diffuse.1, diffuse.2));
         let _ = i;
     }
 
@@ -176,16 +200,22 @@ pub fn build(g: &GameCtx, spec: &Spec) -> Result<Built> {
     Ok(Built { report, files })
 }
 
-fn material_from_template(g: &GameCtx, stem: &str) -> Result<Vec<u8>> {
-    assert_eq!(stem.len(), TEMPLATE_STEM.len());
-    let mut d = g.read_archive(&g.find_one(&format!("/{TEMPLATE_MAT}._xmat"))?)?;
-    let mut n = 0;
-    let (from, to) = (TEMPLATE_STEM.as_bytes(), stem.as_bytes());
-    let mut i = 0;
+pub fn material_from_template(g: &GameCtx, t: &Template, stem: &str, alpha_test: Option<u8>) -> Result<Vec<u8>> {
+    assert_eq!(stem.len(), t.stem.len());
+    let mut d = g.read_archive(&g.find_one(&format!("/{}._xmat", t.material))?)?;
+    let (from, to) = (t.stem.as_bytes(), stem.as_bytes());
+    let (mut n, mut i) = (0, 0);
     while i + from.len() <= d.len() {
         if &d[i..i + from.len()] == from { d[i..i + from.len()].copy_from_slice(to); n += 1; i += from.len() } else { i += 1 }
     }
-    if n != 2 { bail!("template material {TEMPLATE_MAT}: expected its name twice (diffuse, normal), found {n}"); }
+    let want = 2 + t.specular.is_some() as usize;
+    if n != want { bail!("template material {}: expected its stem {want} times (one per texture), found {n}", t.material); }
+    if let (true, Some(cut)) = (t.alpha_test, alpha_test) {
+        let pat = [&13u16.to_le_bytes()[..], b"MaskReference"].concat();
+        let at = d.windows(pat.len()).position(|w| w == pat.as_slice()).context("template has no MaskReference")? + pat.len();
+        let tl = u16::from_le_bytes([d[at], d[at + 1]]) as usize;
+        d[at + 2 + tl + 2 + 4] = cut;
+    }
     Ok(d)
 }
 
@@ -234,11 +264,27 @@ pub fn file_mtime(p: &Path) -> u64 { std::fs::metadata(p).and_then(|m| m.modifie
 mod tests {
     use super::*;
     #[test]
+    fn templates_take_our_texture_names_and_cut_off() {
+        let Some(g) = crate::game::test_game() else { eprintln!("skip: RISEN_GAME not set"); return };
+        for t in [&OPAQUE, &OPAQUE_SPECULAR, &ALPHA_TEST] {
+            let stem = stem_for("My Leafy Cloth", t.stem.len());
+            let d = material_from_template(&g, t, &stem, t.alpha_test.then_some(77)).unwrap();
+            let m = risen_formats::xmat::parse(&d).unwrap();
+            assert!(m.all.iter().all(|x| x.starts_with(&stem)), "{}: {:?}", t.material, m.all);
+            assert_eq!(m.all.len(), 2 + t.specular.is_some() as usize, "{}", t.material);
+            if t.alpha_test {
+                assert_eq!(crate::mesh::shader_value(&d, "MaskReference").unwrap()[0], 77);
+                assert_eq!(crate::mesh::shader_value(&d, "BlendMode").unwrap()[2], 1);
+            }
+            crate::gr01::Resource::parse(&d).unwrap();
+        }
+    }
+    #[test]
     fn stems_have_the_template_length_and_differ() {
         let names = ["My Crate Wood", "My Crate Wood 2", "x", "Long_Blade_Metal_Two_Handed", "ящик"];
-        let stems: Vec<String> = names.iter().map(|n| stem_for(n)).collect();
+        let stems: Vec<String> = names.iter().map(|n| stem_for(n, OPAQUE.stem.len())).collect();
         eprintln!("{stems:?}");
-        for s in &stems { assert_eq!(s.len(), TEMPLATE_STEM.len(), "{s}"); }
+        for s in &stems { assert_eq!(s.len(), OPAQUE.stem.len(), "{s}"); }
         let mut u = stems.clone(); u.sort(); u.dedup();
         assert_eq!(u.len(), stems.len());
     }

@@ -59,7 +59,22 @@ def _material_spec(mat, tmp):
         if bsdf:
             spec["diffuse"] = _image_png(_linked_image(bsdf.inputs.get("Base Color")), tmp)
             spec["normal"] = _image_png(_linked_image(bsdf.inputs.get("Normal")), tmp)
+            s = bsdf.inputs.get("Specular IOR Level") or bsdf.inputs.get("Specular")
+            spec["specular"] = _image_png(_linked_image(s), tmp)
+            spec["alpha_test"] = _alpha_cutoff(mat, bsdf)
     return spec
+
+
+def _alpha_cutoff(mat, bsdf):
+    """The alpha-test cut-off (0..255) when the material's Alpha is driven by its texture, else None.
+    A 'greater than' Math node in between gives the threshold (as Risen Model import builds it)."""
+    a = bsdf.inputs.get("Alpha")
+    if a is None or not a.is_linked:
+        return None
+    node = a.links[0].from_node
+    if node.type == "MATH" and node.operation == "GREATER_THAN":
+        return max(1, min(255, round(node.inputs[1].default_value * 255)))
+    return int(mat.get("risen_mask", 128))
 
 
 def gather(context, objects, scale, tmp):

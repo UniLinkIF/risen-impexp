@@ -12,7 +12,7 @@ import os
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
 
-from . import catalog, core
+from . import catalog, core, materials
 
 
 def _search(self, context, edit_text):
@@ -79,6 +79,7 @@ class RISEN_OT_import_mesh(bpy.types.Operator):
         for ob in obs:
             ob.name = stem
             ob["risen_entry"] = out["entry"]
+        materials.apply_to_objects(obs, out["materials"], core.cache_dir())
         col_note = ""
         if self.with_collision and obs:
             col, c = import_collision(stem, self.scale, obs[0])

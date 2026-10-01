@@ -15,14 +15,18 @@ pub struct SkinInput {
     pub uvs: Vec<[f32; 2]>,
     pub tri_material: Vec<u32>,
     pub weights: Vec<[(u32, f32); 4]>,
+    /// Shape keys by name: a game-space delta per vertex (as `positions`).
+    pub morphs: Vec<(String, Vec<[f32; 3]>)>,
 }
 
 /// A material of the new mesh: one the base actor has (same name) is kept with its maps;
 /// otherwise `diffuse` / `normal` name the textures (their `._ximg` are the caller's).
-pub struct NewMaterial { pub name: String, pub diffuse: Option<String>, pub normal: Option<String> }
+pub struct NewMaterial { pub name: String, pub diffuse: Option<String>, pub normal: Option<String>, pub specular: Option<String> }
 
-/// `base` with its first mesh (and that mesh's skin) replaced by `input`. Other meshes, their
-/// skins and morph targets go (they described the old model); skeleton and the rest stay.
+/// `base` with its first mesh (and that mesh's skin) replaced by `input`. Other meshes and their
+/// skins go (they described the old model); skeleton and the rest stay. The face shapes (morph
+/// targets) come from `input.morphs` by name, keeping the base's phoneme sets so lip-sync still
+/// finds them; without any, they go too.
 pub fn replace_mesh(base: &Actor, input: &SkinInput, materials: &[NewMaterial], bone_nodes: &[u32]) -> Result<Actor> {
     let mut a = base.clone();
     let old = a.sections.iter().find_map(|s| match s { Section::Mesh(m) => Some(m.clone()), _ => None }).context("the base actor has no mesh")?;
@@ -37,7 +41,7 @@ pub fn replace_mesh(base: &Actor, input: &SkinInput, materials: &[NewMaterial], 
         let mut mat = match base_mats.iter().find(|b| b.name.eq_ignore_ascii_case(&m.name)) {
             Some(b) => b.clone(),
             None => {
-                let maps = [(2u8, &m.diffuse), (5u8, &m.normal)].into_iter()
+                let maps = [(2u8, &m.diffuse), (5u8, &m.normal), (3u8, &m.specular)].into_iter()
                     .filter_map(|(kind, t)| t.as_ref().map(|t| Map { params: [1.0, 0.0, 0.0, 1.0, 1.0, 0.0], material: 0, kind, flag: 0, texture: t.clone() }))
                     .collect();
                 Material { version: proto_version, colors: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 25.0, 0.0, 1.0, 1.0], u16a: 0, transparency: 70, name: m.name.clone(), maps }
@@ -107,13 +111,15 @@ pub fn replace_mesh(base: &Actor, input: &SkinInput, materials: &[NewMaterial], 
         for (b, x) in v { let node = bone_nodes[b as usize]; bones.insert(node); influences.push((x / sum, node as u16, itag)); }
     }
     let skin = Skin { version: old_skin.version, node: old.node, local_bones: bones.len() as u32, skin_index: old_skin.skin_index, influences, ranges };
+    let mut new_morphs = morph_body(&a, input, &base_v, old.node)?;
 
     let mut out = vec![];
     let mut done = false;
     for s in a.sections.drain(..) {
         match s {
             Section::Mesh(_) if !done => { out.push(Section::Mesh(mesh.clone())); out.push(Section::Skin(skin.clone())); done = true; }
-            Section::Mesh(_) | Section::Skin(_) | Section::Raw { id: 12, .. } => {}
+            Section::Raw { id: 12, version, .. } => if let Some(body) = new_morphs.take() { out.push(Section::Raw { id: 12, version, body }) },
+            Section::Mesh(_) | Section::Skin(_) => {}
             Section::Materials { .. } => out.push(Section::Materials { version, counts: [nmat, nmat, 0], list: list.clone() }),
             other => out.push(other),
         }
@@ -136,7 +142,7 @@ mod tests {
     #[test]
     fn replacing_an_actor_with_its_own_mesh_keeps_it() {
         let Some(g) = crate::game::test_game() else { eprintln!("skip: RISEN_GAME not set"); return };
-        for name in ["Ani_Hero_Armor_Player", "Ani_Wolf_Monster_Wolf"] {
+        for name in ["Ani_Hero_Armor_Player", "Ani_Wolf_Monster_Wolf", "Ani_Hero_Head_Player"] {
             let d = g.read(&g.find_one(&format!("/{name}._xmac")).unwrap()).unwrap().0;
             let base = read(&d).unwrap();
             let m = base.sections.iter().find_map(|s| match s { Section::Mesh(m) => Some(m.clone()), _ => None }).unwrap();
@@ -166,10 +172,19 @@ mod tests {
                 w
             }).collect();
             let list = base.sections.iter().find_map(|s| match s { Section::Materials { list, .. } => Some(list.clone()), _ => None }).unwrap();
-            let mats: Vec<NewMaterial> = list.iter().map(|m| NewMaterial { name: m.name.clone(), diffuse: None, normal: None }).collect();
-            let input = SkinInput { positions, corner_vertex: cv, normals: cn, uvs: cu, tri_material: tm, weights };
+            let mats: Vec<NewMaterial> = list.iter().map(|m| NewMaterial { name: m.name.clone(), diffuse: None, normal: None, specular: None }).collect();
+            // Face shapes per final vertex, from the raw vertices the game lists them on.
+            let per_final = |a: &Actor| -> Vec<(String, Vec<[f32; 3]>)> {
+                let mm = a.sections.iter().find_map(|s| match s { Section::Mesh(m) => Some(m.clone()), _ => None }).unwrap();
+                let bv: Vec<u32> = mm.layers.iter().find(|l| l.kind == 5).unwrap().data.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+                crate::morph::per_vertex(a).unwrap().into_iter().map(|(n, d)| { let mut o = vec![[0f32; 3]; mm.final_vertices as usize]; for (r, &v) in bv.iter().enumerate() { o[v as usize] = d[r]; } (n, o) }).collect()
+            };
+            let morphs = per_final(&base);
+            let input = SkinInput { positions, corner_vertex: cv, normals: cn, uvs: cu, tri_material: tm, weights, morphs: morphs.clone() };
             let out = write(&replace_mesh(&base, &input, &mats, &bone_nodes).unwrap());
-            read(&out).unwrap();
+            let back = per_final(&read(&out).unwrap());
+            assert_eq!(back.len(), morphs.len(), "{name}: face shapes");
+            for ((n0, d0), (n1, d1)) in morphs.iter().zip(&back) { assert_eq!(n0, n1); assert!(d0.iter().zip(d1).all(|(a, b)| (0..3).all(|k| (a[k] - b[k]).abs() < 1e-4)), "{name}: {n0} moved"); }
             let (a0, a1) = (risen_formats::xmesh_skin::parse_skinned_mesh(&d).unwrap(), risen_formats::xmesh_skin::parse_skinned_mesh(&out).unwrap());
             let nf = m.subs.iter().map(|s| s.indices.len() / 3).sum::<usize>();
             let corners = |s: &risen_formats::xmesh_skin::SkinnedMesh| {
@@ -191,7 +206,7 @@ mod tests {
 }
 
 #[derive(serde::Deserialize)]
-pub struct MatSpec { pub name: String, pub diffuse: Option<String>, pub normal: Option<String> }
+pub struct MatSpec { pub name: String, pub diffuse: Option<String>, pub normal: Option<String>, #[serde(default)] pub specular: Option<String>, #[serde(default)] pub alpha_test: Option<u8> }
 
 #[derive(serde::Deserialize)]
 pub struct ActorSpec {
@@ -204,7 +219,13 @@ pub struct ActorSpec {
     pub corners: usize,
     pub bones: Vec<String>,
     pub materials: Vec<MatSpec>,
+    /// Shape keys: name and a file of f32[3] per vertex, game space.
+    #[serde(default)]
+    pub morphs: Vec<MorphSpec>,
 }
+
+#[derive(serde::Deserialize)]
+pub struct MorphSpec { pub name: String, pub file: String }
 
 #[derive(serde::Serialize)]
 pub struct ActorReport { pub actor: String, pub path: String, pub replaced: bool, pub vertices: usize, pub triangles: usize, pub bones: usize, pub materials: Vec<String> }
@@ -231,7 +252,12 @@ fn read_input(spec: &ActorSpec) -> Result<SkinInput> {
     let o = o + n / 3 * 4;
     let weights = (0..v).map(|i| [0, 1, 2, 3].map(|k| (ul(o + i * 32 + k * 8), fl(o + i * 32 + k * 8 + 4)))).collect();
     ensure!(corner_vertex.iter().all(|&c| (c as usize) < v), "corner refers past the vertices");
-    let mut s = SkinInput { positions, corner_vertex, normals, uvs, tri_material, weights };
+    let morphs = spec.morphs.iter().map(|m| -> Result<(String, Vec<[f32; 3]>)> {
+        let b = std::fs::read(&m.file).with_context(|| format!("read {}", m.file))?;
+        ensure!(b.len() == v * 12, "shape key {}: {} bytes for {v} vertices", m.name, b.len());
+        Ok((m.name.clone(), b.chunks_exact(12).map(|c| [0, 4, 8].map(|k| f32::from_le_bytes(c[k..k + 4].try_into().unwrap()))).collect()))
+    }).collect::<Result<_>>()?;
+    let mut s = SkinInput { positions, corner_vertex, normals, uvs, tri_material, weights, morphs };
     to_skin_winding(&mut s);
     Ok(s)
 }
@@ -262,19 +288,27 @@ pub fn build(g: &crate::game::GameCtx, spec: &ActorSpec) -> Result<(ActorReport,
     let mut notes = vec![];
     for m in &spec.materials {
         let name = m.name.rsplit_once('.').filter(|(_, n)| n.len() == 3 && n.bytes().all(|c| c.is_ascii_digit())).map(|(a, _)| a).unwrap_or(&m.name).to_string();
-        if base_names.contains(&name.to_lowercase()) { notes.push(format!("{name}: kept")); mats.push(NewMaterial { name, diffuse: None, normal: None }); continue; }
-        let stem: String = format!("BM_{}", name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').collect::<String>());
-        let mut tex = |png: &Option<String>, suffix: &str, normal: bool| -> Result<Option<String>> {
+        if base_names.contains(&name.to_lowercase()) { notes.push(format!("{name}: kept")); mats.push(NewMaterial { name, diffuse: None, normal: None, specular: None }); continue; }
+        // Texture names follow a game material template (its stem length), and that template is
+        // written as the material's ._xmat too, so the shader knows alpha test and specular.
+        let t = if m.alpha_test.is_some() { &crate::export::ALPHA_TEST } else if m.specular.is_some() { &crate::export::OPAQUE_SPECULAR } else { &crate::export::OPAQUE };
+        let stem = crate::export::stem_for(&name, t.stem.len());
+        let mut tex = |png: &Option<String>, suffix: &str, kind: u8| -> Result<Option<String>> {
             let Some(p) = png else { return Ok(None) };
             let (px, w, h) = crate::ximg_write::load_png(std::path::Path::new(p)).with_context(|| format!("material {name}: {p}"))?;
-            let tname = format!("{stem}_{suffix}");
-            let (px, kind) = if normal { (crate::ximg_write::to_dxt5nm(&px), crate::ximg_write::Kind::Dxt5) } else { (px, crate::ximg_write::Kind::Dxt1) };
-            files.push((format!("data/compiled/images/BlenderMod/{tname}._ximg"), crate::ximg_write::write(&px, w, h, kind, now)?));
+            let tname = format!("{stem}{suffix}");
+            let (px, k) = match kind { 5 => (crate::ximg_write::to_dxt5nm(&px), crate::ximg_write::Kind::Dxt5), 2 if t.alpha_test => (px, crate::ximg_write::Kind::Dxt5), _ => (px, crate::ximg_write::Kind::Dxt1) };
+            files.push((format!("data/compiled/images/BlenderMod/{tname}._ximg"), crate::ximg_write::write(&px, w, h, k, now)?));
             Ok(Some(tname))
         };
-        let (diffuse, normal) = (tex(&m.diffuse, "Diffuse_S1", false)?, tex(&m.normal, "Normal_S1", true)?);
-        notes.push(format!("{name}: new{}", if diffuse.is_none() { " (no Base Color image: untextured)" } else { "" }));
-        mats.push(NewMaterial { name, diffuse, normal });
+        let diffuse = tex(&m.diffuse, t.diffuse, 2)?;
+        let normal = tex(&m.normal, t.normal, 5)?;
+        let specular = match t.specular { Some(sfx) => tex(&m.specular, sfx, 3)?, None => None };
+        let mat_name = format!("{stem}{}", t.diffuse);
+        files.push((format!("data/common/materials/{mat_name}._xmat"), crate::export::material_from_template(g, t, &stem, m.alpha_test)?));
+        notes.push(format!("{name}: new {mat_name}{}", if diffuse.is_none() { " (no Base Color image: untextured)" } else { "" }));
+        let name = mat_name;
+        mats.push(NewMaterial { name, diffuse, normal, specular });
     }
     let actor = replace_mesh(&base, &input, &mats, &bone_nodes)?;
     let replaced = spec.name.eq_ignore_ascii_case(&crate::actor::stem(&entry));
@@ -283,4 +317,22 @@ pub fn build(g: &crate::game::GameCtx, spec: &ActorSpec) -> Result<(ActorReport,
     files.push((path.clone(), crate::xmac_write::write(&actor)));
     let report = ActorReport { actor: spec.name.clone(), path, replaced, vertices: input.positions.len(), triangles: input.corner_vertex.len() / 3, bones: bone_nodes.len(), materials: notes };
     Ok((report, files))
+}
+
+/// Section 12 for the new mesh: the base's targets that `input` has a shape key for (same name),
+/// with the base's phoneme sets and ranges, then any new shape keys. Deltas go on the raw
+/// vertices (`base_v` = each raw vertex's Blender vertex). None when there is nothing to write.
+fn morph_body(base: &Actor, input: &SkinInput, base_v: &[u32], node: u32) -> Result<Option<Vec<u8>>> {
+    let Some(body) = base.sections.iter().find_map(|s| match s { Section::Raw { id: 12, body, .. } => Some(body), _ => None }) else { return Ok(None) };
+    if input.morphs.is_empty() { return Ok(None); }
+    let m = crate::morph::read(body)?;
+    for (name, d) in &input.morphs { ensure!(d.len() == input.positions.len(), "shape key {name}: {} deltas for {} vertices", d.len(), input.positions.len()); }
+    let deltas = |d: &Vec<[f32; 3]>| vec![crate::morph::MeshDeltas { node, deltas: base_v.iter().enumerate().filter(|(_, &v)| d[v as usize].iter().any(|x| x.abs() > 1e-5)).map(|(r, &v)| (r as u32, d[v as usize])).collect() }];
+    let mut targets: Vec<crate::morph::Target> = m.targets.iter().filter_map(|t| input.morphs.iter().find(|(n, _)| n == &t.name).map(|(_, d)| crate::morph::Target { meshes: deltas(d), ..t.clone() })).collect();
+    for (name, d) in &input.morphs {
+        if !m.targets.iter().any(|t| &t.name == name) {
+            targets.push(crate::morph::Target { name: name.clone(), range: (0.0, 1.0), lod: m.lod, phonemes: 0, meshes: deltas(d), transforms: vec![] });
+        }
+    }
+    Ok(Some(crate::morph::write(&crate::morph::Morphs { lod: m.lod, tangents: m.tangents, targets })))
 }

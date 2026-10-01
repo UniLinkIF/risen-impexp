@@ -73,7 +73,8 @@ fn convert_normal(rgba: &[u8]) -> Vec<u8> {
 }
 
 #[derive(serde::Serialize)]
-pub struct Material { pub name: String, pub diffuse: Option<String>, pub normal: Option<String> }
+/// `blend`: the shader's BlendMode — 0 opaque, 1 alpha test at `mask` (0..255), 2 alpha blend, 7 additive.
+pub struct Material { pub name: String, pub diffuse: Option<String>, pub normal: Option<String>, pub specular: Option<String>, pub blend: u32, pub mask: u8 }
 
 #[derive(serde::Serialize)]
 pub struct MeshOut { pub entry: String, pub obj: String, pub vertices: usize, pub triangles: usize, pub materials: Vec<Material>, pub warnings: Vec<String> }
@@ -82,7 +83,7 @@ pub struct MeshOut { pub entry: String, pub obj: String, pub vertices: usize, pu
 /// tried as a texture name (a few meshes name the texture directly).
 pub fn material(g: &GameCtx, tex: &TextureIndex, name: &str, out: &Path, warnings: &mut Vec<String>) -> Result<Material> {
     let base = name.split('.').next().unwrap_or(name);
-    let mut m = Material { name: name.to_string(), diffuse: None, normal: None };
+    let mut m = Material { name: name.to_string(), diffuse: None, normal: None, specular: None, blend: 0, mask: 0 };
     match g.find_one(&format!("/{base}._xmat")) {
         Ok(entry) => {
             let (bytes, _) = g.read(&entry)?;
@@ -91,11 +92,27 @@ pub fn material(g: &GameCtx, tex: &TextureIndex, name: &str, out: &Path, warning
             if let Some(n) = &t.normal {
                 match tex.png(g, n, out, "_n", Some(convert_normal)) { Ok(p) => m.normal = p, Err(e) => warnings.push(format!("material {name}: normal map {n} skipped ({e})")) }
             }
+            if let Some(sp) = &t.specular {
+                match tex.png(g, sp, out, "", None) { Ok(p) => m.specular = p, Err(e) => warnings.push(format!("material {name}: specular map {sp} skipped ({e})")) }
+            }
+            m.blend = shader_value(&bytes, "BlendMode").and_then(|v| v.get(2..6).map(|b| u32::from_le_bytes(b.try_into().unwrap()))).unwrap_or(0);
+            m.mask = shader_value(&bytes, "MaskReference").and_then(|v| v.first().copied()).unwrap_or(0);
         }
         Err(_) => m.diffuse = tex.png(g, base, out, "", None)?,
     }
     if m.diffuse.is_none() { warnings.push(format!("material {name}: no diffuse texture found")); }
     Ok(m)
+}
+
+/// The value bytes of the first shader property called `name` (`[u16 len][name][u16 len][type][u16 30][u32 size][value]`).
+pub fn shader_value(d: &[u8], name: &str) -> Option<Vec<u8>> {
+    let mut pat = (name.len() as u16).to_le_bytes().to_vec();
+    pat.extend(name.as_bytes());
+    let at = d.windows(pat.len()).position(|w| w == pat.as_slice())? + pat.len();
+    let tl = u16::from_le_bytes([*d.get(at)?, *d.get(at + 1)?]) as usize;
+    let v = at + 2 + tl + 2;
+    let size = u32::from_le_bytes(d.get(v..v + 4)?.try_into().ok()?) as usize;
+    Some(d.get(v + 4..v + 4 + size)?.to_vec())
 }
 
 /// `name` is an entry path (`/…/Foo._xmsh`) or a bare mesh name (`Foo`, `Foo._xmsh`).
@@ -159,3 +176,4 @@ pub fn weld(pos: &[[f32; 3]]) -> (Vec<[f32; 3]>, Vec<u32>) {
     let map = pos.iter().map(|p| *seen.entry(p.map(f32::to_bits)).or_insert_with(|| { uniq.push(*p); uniq.len() as u32 - 1 })).collect();
     (uniq, map)
 }
+

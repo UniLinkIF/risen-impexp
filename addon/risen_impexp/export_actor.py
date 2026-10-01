@@ -4,6 +4,9 @@ Select the mesh(es) bound to a skeleton imported as Risen Actor (Armature modifi
 vertex groups named after the bones). The core keeps the base actor's skeleton and everything
 else, and swaps in this mesh, its skin and its materials — a new armour or body. Same name as
 the base = replace it, a new name = a new actor beside it.
+
+A head brought in with a character is its own actor: exported alone, it replaces that head, and
+its shape keys (BS_Blink, the mouth shapes) go back as its face shapes, so lip-sync still works.
 """
 
 import json
@@ -34,6 +37,11 @@ def gather_skinned(context, objects, scale, tmp):
     saved = [(m, m.show_viewport) for m in arms]
     for m, _ in saved:
         m.show_viewport = False
+    # Shape keys at rest: the mesh goes out as its basis, each key as a delta from it.
+    keyed = [(o, o.show_only_shape_key, o.active_shape_key_index) for o in objects if o.data.shape_keys]
+    for o, _, _ in keyed:
+        o.show_only_shape_key, o.active_shape_key_index = True, 0
+    shapes, counts = {}, []
     try:
         dg = context.evaluated_depsgraph_get()
         dg.update()
@@ -92,12 +100,27 @@ def gather_skinned(context, objects, scale, tmp):
                     while len(row) < 8:
                         row += [0, 0.0]
                     weights.append(row)
+                counts.append(nv)
+                keys = ob.data.shape_keys
+                if keys and len(ob.data.vertices) == nv:
+                    rot = np.array(ob.matrix_world.to_3x3(), np.float32)
+                    basis = np.empty(nv * 3, np.float32)
+                    keys.reference_key.data.foreach_get("co", basis)
+                    for kb in keys.key_blocks:
+                        if kb == keys.reference_key:
+                            continue
+                        c = np.empty(nv * 3, np.float32)
+                        kb.data.foreach_get("co", c)
+                        d = ((c - basis).reshape(-1, 3) @ rot.T) / scale
+                        shapes.setdefault(kb.name, {})[len(counts) - 1] = d[:, [0, 2, 1]]
                 vbase += nv
             finally:
                 ev.to_mesh_clear()
     finally:
         for m, show in saved:
             m.show_viewport = show
+        for o, only, idx in keyed:
+            o.show_only_shape_key, o.active_shape_key_index = only, idx
     if not pos:
         return None
     wb = np.zeros((len(weights), 4), np.uint32)
@@ -109,7 +132,15 @@ def gather_skinned(context, objects, scale, tmp):
     packed[:, 0::2] = wb
     packed[:, 1::2] = ww.view(np.uint32)
     return (np.concatenate(pos).astype(np.float32), np.concatenate(cv).astype(np.uint32), np.concatenate(nrm).astype(np.float32),
-            np.concatenate(uv).astype(np.float32), np.concatenate(mat).astype(np.uint32), packed, bones, materials)
+            np.concatenate(uv).astype(np.float32), np.concatenate(mat).astype(np.uint32), packed, bones, materials,
+            {n: np.concatenate([per.get(i, np.zeros((c, 3), np.float32)) for i, c in enumerate(counts)]).astype(np.float32) for n, per in shapes.items()})
+
+
+def _base_of(objects):
+    """The head actor when every object is a head brought in with a character (its own actor in
+    the game, face shapes and all), else None: the armature's actor is the base."""
+    heads = {o.get("risen_head") for o in objects}
+    return heads.pop() if len(heads) == 1 and None not in heads else None
 
 
 class RISEN_OT_export_actor(bpy.types.Operator):
@@ -133,7 +164,7 @@ class RISEN_OT_export_actor(bpy.types.Operator):
     def invoke(self, context, event):
         arm = next(_armature_of(o) for o in context.selected_objects if o.type == "MESH" and _armature_of(o))
         if not self.name:
-            self.name = arm["risen_actor"]
+            self.name = _base_of([o for o in context.selected_objects if o.type == "MESH" and _armature_of(o)]) or arm["risen_actor"]
         return context.window_manager.invoke_props_dialog(self, width=480)
 
     def draw(self, context):
@@ -150,12 +181,13 @@ class RISEN_OT_export_actor(bpy.types.Operator):
         if len(arms) != 1:
             self.report({"ERROR"}, f"Виділені меші мають бути на одному скелеті Risen (зараз: {', '.join(sorted(arms)) or 'жодного'})")
             return {"CANCELLED"}
+        base = _base_of(objects) or arms.pop()
         tmp = tempfile.mkdtemp(prefix="risen_actor_")
         g = gather_skinned(context, objects, self.scale, tmp)
         if g is None:
             self.report({"ERROR"}, "У виділених мешах немає трикутників")
             return {"CANCELLED"}
-        pos, cv, nrm, uv, mat, packed, bones, materials = g
+        pos, cv, nrm, uv, mat, packed, bones, materials, shapes = g
         if not bones:
             self.report({"ERROR"}, "Жодна вершина не має ваг кісток (групи вершин з назвами кісток)")
             return {"CANCELLED"}
@@ -165,7 +197,12 @@ class RISEN_OT_export_actor(bpy.types.Operator):
                 f.write(np.ascontiguousarray(a).tobytes())
         spec = os.path.join(tmp, "spec.json")
         with open(spec, "w", encoding="utf-8") as f:
-            json.dump({"base": arms.pop(), "name": self.name, "geometry": geo, "vertices": len(pos), "corners": len(cv), "bones": bones, "materials": materials}, f)
+            morphs = []
+            for i, (n, d) in enumerate(shapes.items()):
+                p = os.path.join(tmp, f"shape_{i}.bin")
+                np.ascontiguousarray(d).tofile(p)
+                morphs.append({"name": n, "file": p})
+            json.dump({"base": base, "name": self.name, "geometry": geo, "vertices": len(pos), "corners": len(cv), "bones": bones, "materials": materials, "morphs": morphs}, f)
         try:
             if self.mode == "package":
                 folder = bpy.path.abspath(self.folder) if self.folder else os.path.join(prefs().mods_dir or tmp, self.name)

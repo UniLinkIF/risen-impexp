@@ -170,12 +170,14 @@ pub type TexFn<'a> = dyn FnMut(&str, bool) -> Result<Option<Vec<u8>>> + 'a;
 
 /// One skinned mesh on the glb skeleton: `joint_map[i]` = glb joint of the mesh's own node `i`
 /// (identity for the body; by bone name for an attached head, whose bind pose equals the body's).
-pub struct Part<'a> { pub mesh: &'a xmesh_skin::SkinnedMesh, pub joint_map: Vec<usize> }
+pub struct Part<'a> { pub name: String, pub mesh: &'a xmesh_skin::SkinnedMesh, pub joint_map: Vec<usize>, pub morphs: Vec<(String, Vec<[f32; 3]>)> }
 
-pub fn build_glb(name: &str, nodes: &[SkeletonNode], parts: &[Part], anims: &[(String, Vec<BoneMotion>)], tex: &mut TexFn) -> Result<(Vec<u8>, Summary)> {
+/// `blend(material)` = the game shader's (BlendMode, MaskReference) for a material name: 1 = alpha
+/// test, 2/7 = blended; written as glTF alphaMode MASK (cutoff mask/255) or BLEND.
+pub fn build_glb(name: &str, nodes: &[SkeletonNode], parts: &[Part], anims: &[(String, Vec<BoneMotion>)], tex: &mut TexFn, blend: &dyn Fn(&str) -> (u32, u8)) -> Result<(Vec<u8>, Summary)> {
     let globals = bind_globals(nodes)?;
     let mut bin = Bin { data: vec![], views: vec![], accessors: vec![] };
-    let (mut images, mut textures, mut materials, mut prims) = (vec![], vec![], vec![], vec![]);
+    let (mut images, mut textures, mut materials, mut gmeshes) = (vec![], vec![], vec![], vec![]);
     let mut tex_by_name: std::collections::HashMap<(String, bool), Option<usize>> = Default::default();
     let (mut tris, mut verts) = (0, 0);
 
@@ -205,6 +207,11 @@ pub fn build_glb(name: &str, nodes: &[SkeletonNode], parts: &[Part], anims: &[(S
         let a_uv = bin.f32s(&mesh.uvs, Some(34962), "VEC2", false);
         let a_j = bin.acc(&js, Some(34962), 5123, nv, "VEC4", None);
         let a_w = bin.f32s(&ws, Some(34962), "VEC4", false);
+        let targets: Vec<Value> = part.morphs.iter().map(|(_, d)| {
+            let d: Vec<[f32; 3]> = d.iter().map(|p| conv_p(*p, UNIT)).collect();
+            json!({ "POSITION": bin.f32s(&d, Some(34962), "VEC3", true) })
+        }).collect();
+        let mut prims = vec![];
         for (mi, m) in mesh.materials.iter().enumerate() {
             let idx: Vec<u8> = mesh.faces.iter().zip(&mesh.face_material_ids).filter(|(_, id)| **id as usize == mi).flat_map(|(f, _)| [f[0], f[2], f[1]].into_iter().flat_map(|i| i.to_le_bytes())).collect();
             if idx.is_empty() { continue; }
@@ -212,6 +219,11 @@ pub fn build_glb(name: &str, nodes: &[SkeletonNode], parts: &[Part], anims: &[(S
             tris += count / 3;
             let a_i = bin.acc(&idx, Some(34963), 5125, count, "SCALAR", None);
             let mut mat = json!({ "name": m.name, "pbrMetallicRoughness": { "metallicFactor": 0.0, "roughnessFactor": 1.0 } });
+            match blend(&m.name) {
+                (1, mask) => { mat["alphaMode"] = json!("MASK"); mat["alphaCutoff"] = json!(if mask == 0 { 0.5 } else { mask as f32 / 255.0 }); }
+                (2, _) | (7, _) => { mat["alphaMode"] = json!("BLEND"); }
+                _ => {}
+            }
             for (file, is_normal) in [(&m.diffuse, false), (&m.normal, true)] {
                 let Some(file) = file else { continue };
                 let key = (file.clone(), is_normal);
@@ -236,9 +248,17 @@ pub fn build_glb(name: &str, nodes: &[SkeletonNode], parts: &[Part], anims: &[(S
                 }
             }
             materials.push(mat);
-            prims.push(json!({ "attributes": { "POSITION": a_pos, "NORMAL": a_nrm, "TEXCOORD_0": a_uv, "JOINTS_0": a_j, "WEIGHTS_0": a_w }, "indices": a_i, "material": materials.len() - 1 }));
+            let mut prim = json!({ "attributes": { "POSITION": a_pos, "NORMAL": a_nrm, "TEXCOORD_0": a_uv, "JOINTS_0": a_j, "WEIGHTS_0": a_w }, "indices": a_i, "material": materials.len() - 1 });
+            if !targets.is_empty() { prim["targets"] = json!(targets); }
+            prims.push(prim);
         }
         ensure!(!prims.is_empty(), "no triangles with a material");
+        let mut gm = json!({ "name": part.name, "primitives": prims });
+        if !part.morphs.is_empty() {
+            gm["weights"] = json!(vec![0.0; part.morphs.len()]);
+            gm["extras"] = json!({ "targetNames": part.morphs.iter().map(|(n, _)| n).collect::<Vec<_>>() });
+        }
+        gmeshes.push(gm);
     }
 
     let mut gnodes: Vec<Value> = nodes.iter().map(|n| json!({ "name": n.name, "translation": conv_p(n.position, UNIT), "rotation": conv_q(n.rotation) })).collect();
@@ -251,12 +271,14 @@ pub fn build_glb(name: &str, nodes: &[SkeletonNode], parts: &[Part], anims: &[(S
     }
     let mut root_children: Vec<usize> = nodes.iter().enumerate().filter(|(_, n)| n.parent_index.is_none()).map(|(i, _)| i).collect();
     let mut skins = vec![];
-    if !prims.is_empty() {
+    if !gmeshes.is_empty() {
         let ibm: Vec<[f32; 16]> = globals.iter().map(rigid_inverse).collect();
         let a_ibm = bin.f32s(&ibm, None, "MAT4", false);
         skins.push(json!({ "name": format!("{name}_Skin"), "joints": (0..nodes.len()).collect::<Vec<_>>(), "inverseBindMatrices": a_ibm }));
-        root_children.push(gnodes.len());
-        gnodes.push(json!({ "name": format!("{name}_Mesh"), "mesh": 0, "skin": 0 }));
+        for (i, m) in gmeshes.iter().enumerate() {
+            root_children.push(gnodes.len());
+            gnodes.push(json!({ "name": if i == 0 { format!("{name}_Mesh") } else { m["name"].as_str().unwrap_or("Head").to_string() }, "mesh": i, "skin": 0 }));
+        }
     }
     let root = gnodes.len();
     gnodes.push(json!({ "name": name, "children": root_children }));
@@ -307,7 +329,7 @@ pub fn build_glb(name: &str, nodes: &[SkeletonNode], parts: &[Part], anims: &[(S
         "buffers": [{ "byteLength": bin.data.len() }],
         "bufferViews": bin.views, "accessors": bin.accessors,
     });
-    if !prims.is_empty() { doc["meshes"] = json!([{ "name": name, "primitives": prims }]); doc["skins"] = json!(skins); doc["materials"] = json!(materials); }
+    if !gmeshes.is_empty() { doc["meshes"] = json!(gmeshes); doc["skins"] = json!(skins); doc["materials"] = json!(materials); }
     if !gl_anims.is_empty() { doc["animations"] = json!(gl_anims); }
     if !images.is_empty() {
         doc["images"] = json!(images);
@@ -357,12 +379,13 @@ pub fn write_glb(g: &GameCtx, tex: &TextureIndex, entry: &str, head: Option<&str
     let (bytes, _) = g.read(entry)?;
     let nodes = std::panic::catch_unwind(|| xmac::parse_skeleton(&bytes)).map_err(|_| anyhow::anyhow!("skeleton parser panicked"))?.context("skeleton")?;
     if nodes.len() > u16::MAX as usize { bail!("too many nodes"); }
-    let mesh = std::panic::catch_unwind(|| xmesh_skin::parse_skinned_mesh(&bytes)).map_err(|_| anyhow::anyhow!("mesh parser panicked"))?.context("skinned mesh")?;
-    let mut parts = vec![Part { mesh: &mesh, joint_map: (0..nodes.len()).collect() }];
-    let head_data;
+    let mut mesh = std::panic::catch_unwind(|| xmesh_skin::parse_skinned_mesh(&bytes)).map_err(|_| anyhow::anyhow!("mesh parser panicked"))?.context("skinned mesh")?;
+    textures_from_materials(g, &mut mesh);
     let mut warnings = vec![];
+    let mut parts = vec![Part { name: stem(entry), mesh: &mesh, joint_map: (0..nodes.len()).collect(), morphs: morphs_of(&bytes, &mesh, &mut warnings) }];
+    let head_data;
     if let Some(h) = head {
-        match load_head(g, &nodes, h) { Ok(d) => { head_data = d; parts.push(Part { mesh: &head_data.0, joint_map: head_data.1.clone() }); } Err(e) => warnings.push(format!("head {h} not attached: {e:#}")) }
+        match load_head(g, &nodes, h) { Ok(d) => { head_data = d; parts.push(Part { name: stem(&head_data.3), mesh: &head_data.0, joint_map: head_data.1.clone(), morphs: head_data.2.clone() }); } Err(e) => warnings.push(format!("head {h} not attached: {e:#}")) }
     }
     let names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
     let mut anims = vec![];
@@ -376,7 +399,7 @@ pub fn write_glb(g: &GameCtx, tex: &TextureIndex, entry: &str, head: Option<&str
     let (glb, mut s) = build_glb(&stem, &nodes, &parts, &anims, &mut |file: &str, normal: bool| -> Result<Option<Vec<u8>>> {
         if !with_textures { return Ok(None); }
         match tex.texture(g, file, cache, normal)? { Some(rel) => Ok(Some(std::fs::read(cache.join(rel))?)), None => Ok(None) }
-    })?;
+    }, &|mat: &str| material_blend(g, mat))?;
     if let Some(p) = out.parent() { std::fs::create_dir_all(p)?; }
     std::fs::write(out, &glb)?;
     s.glb = out.to_string_lossy().into_owned();
@@ -387,21 +410,57 @@ pub fn write_glb(g: &GameCtx, tex: &TextureIndex, entry: &str, head: Option<&str
 
 /// A head actor (`Ani_Hero_Head_*`) mapped onto `body` by bone name. A head node the body lacks
 /// (the file's own dummy root) maps to Bone_ROOT; no vertex may be weighted to such a node.
-fn load_head(g: &GameCtx, body: &[SkeletonNode], name: &str) -> Result<(xmesh_skin::SkinnedMesh, Vec<usize>)> {
-    let (bytes, _) = g.read(&resolve_actor(g, name)?)?;
+fn load_head(g: &GameCtx, body: &[SkeletonNode], name: &str) -> Result<(xmesh_skin::SkinnedMesh, Vec<usize>, Vec<(String, Vec<[f32; 3]>)>, String)> {
+    let entry = resolve_actor(g, name)?;
+    let (bytes, _) = g.read(&entry)?;
     let hn = xmac::parse_skeleton(&bytes).context("head skeleton")?;
-    let mesh = xmesh_skin::parse_skinned_mesh(&bytes).context("head mesh")?;
+    let mut mesh = xmesh_skin::parse_skinned_mesh(&bytes).context("head mesh")?;
+    textures_from_materials(g, &mut mesh);
     let fallback = body.iter().position(|n| n.name.eq_ignore_ascii_case("Bone_ROOT")).unwrap_or(0);
     let map: Vec<usize> = hn.iter().map(|n| body.iter().position(|b| b.name == n.name).unwrap_or(fallback)).collect();
     for w in mesh.skin_weights.iter().flatten().filter(|w| w.1 > 0.0) {
         let n = hn.get(w.0 as usize).with_context(|| format!("head joint {} out of range", w.0))?;
         ensure!(body.iter().any(|b| b.name == n.name), "head vertex bound to {}, which the body lacks", n.name);
     }
-    Ok((mesh, map))
+    let morphs = morphs_of(&bytes, &mesh, &mut vec![]);
+    Ok((mesh, map, morphs, entry))
+}
+
+/// A texture the actor names that the game does not have (the eyes ask for `…_Eyes_01_Diffuse_S1`,
+/// the game ships `…_Diffuse_01`) is taken from the material's `._xmat`, as the engine does.
+fn textures_from_materials(g: &GameCtx, mesh: &mut xmesh_skin::SkinnedMesh) {
+    let has = |t: &str| g.find_one(&format!("/{t}._ximg")).is_ok();
+    for m in &mut mesh.materials {
+        if m.diffuse.as_deref().map_or(false, has) && m.normal.as_deref().map_or(true, has) { continue; }
+        let base = m.name.split('.').next().unwrap_or(&m.name);
+        let Some(t) = g.find_one(&format!("/{base}._xmat")).ok().and_then(|e| g.read(&e).ok()).and_then(|(d, _)| risen_formats::xmat::parse(&d)) else { continue };
+        if !m.diffuse.as_deref().map_or(false, has) { if let Some(d) = t.diffuse { m.diffuse = Some(d); } }
+        if !m.normal.as_deref().map_or(true, has) { if let Some(n) = t.normal { m.normal = Some(n); } }
+    }
+}
+
+/// The face shapes (blink, the mouth shapes of speech) of an actor, per vertex of `mesh`.
+fn morphs_of(bytes: &[u8], mesh: &xmesh_skin::SkinnedMesh, warnings: &mut Vec<String>) -> Vec<(String, Vec<[f32; 3]>)> {
+    let m = crate::xmac_write::read(bytes).and_then(|a| crate::morph::per_vertex(&a));
+    match m {
+        Ok(m) if m.iter().all(|(_, d)| d.len() == mesh.positions.len()) => m,
+        Ok(m) => { warnings.push(format!("morphs left out: {} targets do not match {} vertices", m.len(), mesh.positions.len())); vec![] }
+        Err(_) => vec![],
+    }
 }
 
 /// Human bodies (`Ani_Hero_*`, not a head itself) come without a head; the player's is the default.
 pub fn default_head(actor_stem: &str) -> Option<&'static str> {
     let s = actor_stem.to_lowercase();
     (s.starts_with("ani_hero_") && !s.contains("_head")).then_some("Ani_Hero_Head_Player")
+}
+
+/// (BlendMode, MaskReference) of the game material called `name` (an actor material has its own `._xmat`).
+pub fn material_blend(g: &GameCtx, name: &str) -> (u32, u8) {
+    let base = name.split('.').next().unwrap_or(name);
+    let Ok(e) = g.find_one(&format!("/{base}._xmat")) else { return (0, 0) };
+    let Ok((d, _)) = g.read(&e) else { return (0, 0) };
+    let b = crate::mesh::shader_value(&d, "BlendMode").and_then(|v| v.get(2..6).map(|x| u32::from_le_bytes(x.try_into().unwrap()))).unwrap_or(0);
+    let m = crate::mesh::shader_value(&d, "MaskReference").and_then(|v| v.first().copied()).unwrap_or(0);
+    (b, m)
 }

@@ -6,6 +6,7 @@ IMPORTS = (
     "risen.import_mesh",
     "risen.import_character",
     "risen.import_motion",
+    "risen.import_lipsync",
     "risen.import_collision",
     "risen.import_world",
     "risen.import_landscape",

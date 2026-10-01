@@ -12,16 +12,16 @@ Works both as a legacy add-on (bl_info) and as a Blender 5.x extension
 bl_info = {
     "name": "Risen ImpExp",
     "author": "BlenderMod",
-    "version": (0, 9, 2),
+    "version": (0, 9, 3),
     "blender": (5, 1, 0),
     "location": "File > Import / Export > Risen",
-    "description": "Import and export Risen 1 models, actors, motions, collision and ground",
+    "description": "Import and export Risen 1 models, actors, motions, lip-sync, collision and ground",
     "category": "Import-Export",
 }
 
-from . import prefs, import_mesh, import_actor, export_mesh, export_motion, export_actor, world, ui, menus  # noqa: E402
+from . import prefs, import_mesh, import_actor, export_mesh, export_motion, export_actor, world, rig, lipsync, ui, menus  # noqa: E402
 
-_modules = (prefs, import_mesh, import_actor, export_mesh, export_motion, export_actor, world, ui, menus)
+_modules = (prefs, import_mesh, import_actor, export_mesh, export_motion, export_actor, world, rig, lipsync, ui, menus)
 
 
 def register():

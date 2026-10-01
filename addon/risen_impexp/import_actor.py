@@ -65,6 +65,10 @@ def import_character(context, name, clips="*", limit=40, head=None):
             arm.animation_data.action = acts[0]
     for a in acts:
         a.use_fake_user = True
+    # A head comes as its own mesh, named after its actor; its face shapes drive lip-sync.
+    for o in obs:
+        if o.type == "MESH" and o.data.shape_keys:
+            o["risen_head"] = o.name.split(".")[0].removesuffix("_Mesh")
     return out, arm, acts
 
 
