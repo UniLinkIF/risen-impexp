@@ -8,9 +8,12 @@
 //! risen-core export <game_dir> <spec.json> install <mod>           install into the game (registered)
 //! risen-core export-motion <game_dir> <spec.json> package <dir> [title] | install <mod>
 //! risen-core export-actor <game_dir> <spec.json> package <dir> [title] | install <mod>
+//! risen-core export-files <game_dir> <dir> package <dir> [title] | install <mod>   files prepared under <dir>/data/...
 //! risen-core layers <game_dir> <query>  ·  world-layer <game_dir> <layer> <out_dir>
 //! risen-core landscape-get <game_dir> <out_dir> [current|archive]  ·  landscape-set <game_dir> <positions.bin> package <dir> | install <mod>
 //! risen-core landscape-set-paint <game_dir> <positions.bin> <paint.bin> package <dir> [title] | install <mod>   heights + ground materials
+//! risen-core landscape-set-topo <game_dir> <positions.bin> <paint.bin|-> <topology.bin> package <dir> [title] | install <mod>   with subdivided / removed ground
+//! risen-core landscape-check <game_dir> <positions.bin> [paint.bin]   how closely the collision follows the edited ground (nothing written)
 //! risen-core uninstall <game_dir> <mod>  ·  risen-core installed <game_dir>
 //! risen-core trees <game_dir> <query>  ·  tree <game_dir> <name> <out_dir>   SpeedTree stand-ins
 //! risen-core actors <game_dir> <query> [limit]  ·  clips <game_dir> <actor> <query> [limit]
@@ -26,6 +29,8 @@ mod cook;
 mod export;
 mod landscape;
 mod landscape_paint;
+mod landscape_col;
+mod landscape_topo;
 mod modpkg;
 mod nxs;
 mod gr01;
@@ -45,7 +50,7 @@ mod terrain_col;
 mod resolve;
 mod world;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use std::path::{Path, PathBuf};
 
 /// The add-on stores the game folder (the one holding `bin\Risen.exe`); `GameCtx` wants the exe.
@@ -57,6 +62,26 @@ fn open_game(dir: &str) -> Result<game::GameCtx> {
 
 #[derive(serde::Serialize)]
 struct Found { name: String, entry: String }
+
+/// Every file under `dir` as (game path, bytes): `dir/data/compiled/...` installs as `data/compiled/...`.
+/// Only paths under `data/` are taken, so a prepared folder maps one to one onto the game folder.
+fn files_under(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut out = vec![];
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).with_context(|| format!("read {}", d.display()))?.flatten() {
+            let p = e.path();
+            if p.is_dir() { stack.push(p); continue; }
+            let rel = p.strip_prefix(dir).unwrap().to_string_lossy().replace('\\', "/");
+            if !rel.to_lowercase().starts_with("data/") { continue; }
+            ensure!(!rel.split('/').any(|c| c == ".."), "{rel}: no .. in paths");
+            out.push((rel, std::fs::read(&p)?));
+        }
+    }
+    ensure!(!out.is_empty(), "no files under {}/data", dir.display());
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
 
 fn find(g: &game::GameCtx, suffix: &str, query: &str, limit: usize) -> Vec<Found> {
     let q = query.to_lowercase();
@@ -194,6 +219,17 @@ usemtl {mat}
             };
             serde_json::json!({ "report": report, "done": done })
         }
+        (Some("export-files"), Some(game), Some(dir), Some(mode)) => {
+            let g = open_game(game)?;
+            let files = files_under(Path::new(dir))?;
+            let target = a(4).context("export-files: missing target")?;
+            let done = match mode {
+                "package" => modpkg::write_package(&g, Path::new(target), a(5).unwrap_or("Files"), &files)?,
+                "install" => modpkg::install(&g, target, &files)?,
+                m => bail!("export mode {m}: use package or install"),
+            };
+            serde_json::json!({ "files": files.len(), "done": done })
+        }
         (Some("export-actor"), Some(game), Some(spec), Some(mode)) => {
             let g = open_game(game)?;
             let spec: skin_export::ActorSpec = serde_json::from_slice(&std::fs::read(spec).with_context(|| format!("read {spec}"))?)?;
@@ -233,6 +269,27 @@ usemtl {mat}
                 m => bail!("mode {m:?}: use package or install"),
             };
             serde_json::json!({ "report": report, "done": done })
+        }
+        (Some("landscape-set-topo"), Some(game), Some(bin), Some(paint)) => {
+            let g = open_game(game)?;
+            let topo_path = a(4).context("landscape-set-topo: missing topology.bin")?;
+            let spec = landscape_topo::read(&std::fs::read(topo_path).with_context(|| format!("read {topo_path}"))?)?;
+            let paint = (paint != "-").then(|| Path::new(paint));
+            let (report, files) = landscape::set_full(&g, Path::new(bin), paint, Some(&spec), true)?;
+            let target = a(6).context("landscape-set-topo: missing target")?;
+            let done = match a(5) {
+                Some("package") => modpkg::write_package(&g, Path::new(target), a(7).unwrap_or("Landscape"), &files)?,
+                Some("install") => modpkg::install(&g, target, &files)?,
+                m => bail!("mode {m:?}: use package or install"),
+            };
+            serde_json::json!({ "report": report, "done": done })
+        }
+        (Some("landscape-check"), Some(game), Some(bin), paint) => {
+            let g = open_game(game)?;
+            let (paint, bin) = (paint.map(Path::new), Path::new(bin));
+            let (rc, coarse) = landscape::set_with(&g, bin, paint, false)?;
+            let (rd, dense) = landscape::set_with(&g, bin, paint, true)?;
+            serde_json::json!({ "coarse": landscape::gap_report(&g, bin, &coarse)?, "dense": landscape::gap_report(&g, bin, &dense)?, "coarse_sectors": rc.sectors, "dense_sectors": rd.sectors })
         }
         (Some("uninstall"), Some(game), Some(name), _) => serde_json::to_value(modpkg::uninstall(&open_game(game)?, name)?)?,
         (Some("installed"), Some(game), _, _) => serde_json::to_value(modpkg::installed(&open_game(game)?)?)?,

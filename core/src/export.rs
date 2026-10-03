@@ -64,14 +64,33 @@ pub const OPAQUE: Template = Template { material: "ItWpn_SwordMisc_01_Diffuse_01
 pub const OPAQUE_SPECULAR: Template = Template { material: "Ani_Hero_Armor_Hands_Diffuse_S1", stem: "Ani_Hero_Armor_Hands", diffuse: "_Diffuse_S1", normal: "_Normal_S1", specular: Some("_Specular_S1"), alpha_test: false };
 /// Alpha test (BlendMode 1; the cut-off is MaskReference) — the hero's cloth.
 pub const ALPHA_TEST: Template = Template { material: "Ani_Hero_Armor_Player_01_Cloth", stem: "Ani_Hero_Armor_Player_01_Cloth", diffuse: "_Diffuse_S1", normal: "_Normal_S1", specular: None, alpha_test: true };
+/// Static meshes need static shaders: the actor templates above pull in the skinned overlays
+/// (`Special_Overlay_*_Skinned`), which render black on a mesh without bones.
+/// Static alpha test — a straw roof (overlays `_Default`, no wind).
+pub const STATIC_ALPHA_TEST: Template = Template { material: "Arch_Roof_Straw_01_Diffuse_01", stem: "Arch_Roof_Straw_01", diffuse: "_Diffuse_01", normal: "_Normal_01", specular: None, alpha_test: true };
+/// Static with a specular (`_Comp_`) map — the goldsmith's table.
+pub const STATIC_SPECULAR: Template = Template { material: "Arch_Obj_GoldSmith_01_Diffuse_01", stem: "Arch_Obj_GoldSmith_01", diffuse: "_Diffuse_01", normal: "_Normal_01", specular: Some("_Comp_01"), alpha_test: false };
 
 fn hash(s: &str) -> u64 { s.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3)) }
 
-/// A stem of exactly `len` characters: `BM_` + letters of the name + `_` + hash.
-pub fn stem_for(name: &str, len: usize) -> String {
-    let part: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).take(len.saturating_sub(8)).collect();
+/// A stem of exactly `len` characters: `BM_` + letters of the name + `_` + at least 8 hex digits of
+/// a hash of `key` (see [`material_key`]).
+pub fn stem_for(key: &str, len: usize) -> String {
+    let name = key;
+    let part: String = name.split('#').next().unwrap_or(name).chars().filter(|c| c.is_ascii_alphanumeric()).take(len.saturating_sub(12)).collect();
     let n = len - 4 - part.len();
     format!("BM_{part}_{}", &format!("{:032x}", (hash(name) as u128) << 64 | hash(&format!("{name}#")) as u128)[..n])
+}
+
+/// What a new material's file names hash: its name and the bytes of its images. Two mods that
+/// both call a material "Material" get different files unless the pictures are the same too.
+pub fn material_key(name: &str, images: &[&Option<String>]) -> String {
+    let mut h = hash(name);
+    for p in images.iter().copied().flatten() {
+        let b = std::fs::read(p).unwrap_or_else(|_| p.as_bytes().to_vec());
+        h = b.iter().fold(h ^ 0x9e37, |h, &x| (h ^ x as u64).wrapping_mul(0x100000001b3));
+    }
+    format!("{name}#{h:016x}")
 }
 
 /// Blender adds `.001`-style suffixes to duplicated names; the game name is what came before.
@@ -129,9 +148,9 @@ pub fn build(g: &GameCtx, spec: &Spec) -> Result<Built> {
             report.materials.push(format!("{}: game material reused", m.name));
             continue;
         }
-        let t = if m.alpha_test.is_some() { &ALPHA_TEST } else if m.specular.is_some() { &OPAQUE_SPECULAR } else { &OPAQUE };
+        let t = if m.alpha_test.is_some() { &STATIC_ALPHA_TEST } else if m.specular.is_some() { &STATIC_SPECULAR } else { &OPAQUE };
         if m.alpha_test.is_some() && m.specular.is_some() { report.warnings.push(format!("material {}: alpha test and specular together has no game template; specular dropped", m.name)); }
-        let stem = stem_for(&m.name, t.stem.len());
+        let stem = stem_for(&material_key(&m.name, &[&m.diffuse, &m.normal, &m.specular]), t.stem.len());
         let (tex_d, tex_n) = (format!("{stem}{}", t.diffuse), format!("{stem}{}", t.normal));
         let diffuse = match &m.diffuse {
             Some(p) => ximg_write::load_png(Path::new(p)).with_context(|| format!("material {}: diffuse {p}", m.name))?,
@@ -266,7 +285,7 @@ mod tests {
     #[test]
     fn templates_take_our_texture_names_and_cut_off() {
         let Some(g) = crate::game::test_game() else { eprintln!("skip: RISEN_GAME not set"); return };
-        for t in [&OPAQUE, &OPAQUE_SPECULAR, &ALPHA_TEST] {
+        for t in [&OPAQUE, &OPAQUE_SPECULAR, &ALPHA_TEST, &STATIC_ALPHA_TEST, &STATIC_SPECULAR] {
             let stem = stem_for("My Leafy Cloth", t.stem.len());
             let d = material_from_template(&g, t, &stem, t.alpha_test.then_some(77)).unwrap();
             let m = risen_formats::xmat::parse(&d).unwrap();
@@ -276,6 +295,7 @@ mod tests {
                 assert_eq!(crate::mesh::shader_value(&d, "MaskReference").unwrap()[0], 77);
                 assert_eq!(crate::mesh::shader_value(&d, "BlendMode").unwrap()[2], 1);
             }
+            if t.material.starts_with("Arch_") || t.material.starts_with("ItWpn_") { assert!(!d.windows(7).any(|w| w == b"Skinned"), "{}: skinned overlay on a static template", t.material); }
             crate::gr01::Resource::parse(&d).unwrap();
         }
     }
@@ -287,6 +307,15 @@ mod tests {
         for s in &stems { assert_eq!(s.len(), OPAQUE.stem.len(), "{s}"); }
         let mut u = stems.clone(); u.sort(); u.dedup();
         assert_eq!(u.len(), stems.len());
+        // Same name, different pictures: different files.
+        let dir = std::env::temp_dir().join("risen_key_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.png"), dir.join("b.png"));
+        std::fs::write(&a, b"one").unwrap();
+        std::fs::write(&b, b"two").unwrap();
+        let k = |p: &std::path::Path| stem_for(&material_key("Material", &[&Some(p.to_string_lossy().into_owned()), &None]), OPAQUE.stem.len());
+        assert_ne!(k(&a), k(&b));
+        assert_eq!(k(&a), k(&a));
     }
 }
 

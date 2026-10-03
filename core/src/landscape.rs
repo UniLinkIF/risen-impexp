@@ -31,7 +31,55 @@ pub fn weld(pos: &[V3]) -> (Vec<V3>, Vec<u32>) {
 }
 
 #[derive(serde::Serialize)]
-pub struct GetReport { pub vertices: usize, pub triangles: usize, pub materials: Vec<crate::mesh::Material>, pub geometry: String }
+pub struct GetReport {
+    pub vertices: usize, pub triangles: usize, pub materials: Vec<crate::mesh::Material>, pub geometry: String,
+    /// `topology.bin` next to the geometry when the installed ground has a topology edit
+    /// (`landscape_topo`): its vertex and triangle counts then differ from the archive's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology: Option<String>,
+}
+
+/// Where the installed topology edit lives (next to the landscape, relative to the game folder).
+pub fn sidecar(g: &GameCtx, e: &str) -> Result<String> {
+    let rel = g.rel(e)?;
+    Ok(format!("{}.topology", rel.strip_suffix("._xmsh").unwrap_or(&rel)))
+}
+
+/// The topology edit installed with the current landscape, if any.
+pub fn installed_topology(g: &GameCtx, e: &str) -> Result<Option<crate::landscape_topo::Spec>> {
+    let p = g.root.join(sidecar(g, e)?);
+    if !p.is_file() { return Ok(None); }
+    Ok(Some(crate::landscape_topo::read(&std::fs::read(&p)?).with_context(|| format!("read {}", p.display()))?))
+}
+
+/// `get current` when the installed ground carries a topology edit: the archive with the edit
+/// replayed is the reference the installed file is read against.
+fn get_topology(g: &GameCtx, e: &str, src: &[u8], spec: &crate::landscape_topo::Spec, out_dir: &Path) -> Result<GetReport> {
+    let base = crate::landscape_topo::apply(src, spec)?;
+    let (cur, _) = g.read(e)?;
+    let (pos, sub) = crate::landscape_paint::recover(&base.bytes, &cur).context("read the installed landscape")?;
+    let mut uniq = base.welded.clone();
+    let mut done = vec![false; uniq.len()];
+    for (i, &u) in base.map.iter().enumerate() { if !done[u as usize] { uniq[u as usize] = pos[i]; done[u as usize] = true; } }
+    let mut wsub = base.welded_sub.clone();
+    for (ft, &wt) in base.tri_welded.iter().enumerate() { wsub[wt as usize] = sub[ft]; }
+    let m = crate::xmsh_geom::decode(src)?;
+    let tex = crate::mesh::TextureIndex::build(g);
+    let mut warnings = vec![];
+    let materials = m.submeshes.iter().map(|s| crate::mesh::material(g, &tex, &s.material, out_dir, &mut warnings)).collect::<Result<Vec<_>>>()?;
+    let mut b = (uniq.len() as u32).to_le_bytes().to_vec();
+    for p in &uniq { for x in p { b.extend(x.to_le_bytes()); } }
+    b.extend((base.welded_tris.len() as u32).to_le_bytes());
+    for t in &base.welded_tris { for i in t { b.extend(i.to_le_bytes()); } }
+    for t in &base.welded_uv { for c in t { b.extend(c[0].to_le_bytes()); b.extend(c[1].to_le_bytes()); } }
+    for s in &wsub { b.extend(s.to_le_bytes()); }
+    std::fs::create_dir_all(out_dir)?;
+    let path = out_dir.join("landscape.bin");
+    std::fs::write(&path, b)?;
+    let tp = out_dir.join("topology.bin");
+    std::fs::write(&tp, crate::landscape_topo::write(spec))?;
+    Ok(GetReport { vertices: uniq.len(), triangles: base.welded_tris.len(), materials, geometry: path.to_string_lossy().into_owned(), topology: Some(tp.to_string_lossy().into_owned()) })
+}
 
 /// The landscape for an editor, with textures. `current = false`: the archive's (vanilla) ground;
 /// `current = true`: what the game shows now (the loose file first, i.e. the installed Landscape mod).
@@ -44,6 +92,10 @@ pub struct GetReport { pub vertices: usize, pub triangles: usize, pub materials:
 pub fn get(g: &GameCtx, out_dir: &Path, current: bool) -> Result<GetReport> {
     let e = entry(g)?;
     let src = g.read_archive(&e)?;
+    if current {
+        if let Some(spec) = installed_topology(g, &e)? { return get_topology(g, &e, &src, &spec, out_dir); }
+        // A stale topology file from another tool would be ignored here; the archive's ground is read.
+    }
     let m = crate::xmsh_geom::decode(&src)?;
     let (mut uniq, map) = weld(&m.positions);
     let mut sub_of = crate::landscape_paint::sub_of(&m);
@@ -67,7 +119,7 @@ pub fn get(g: &GameCtx, out_dir: &Path, current: bool) -> Result<GetReport> {
     std::fs::create_dir_all(out_dir)?;
     let path = out_dir.join("landscape.bin");
     std::fs::write(&path, b)?;
-    Ok(GetReport { vertices: uniq.len(), triangles: m.indices.len() / 3, materials, geometry: path.to_string_lossy().into_owned() })
+    Ok(GetReport { vertices: uniq.len(), triangles: m.indices.len() / 3, materials, geometry: path.to_string_lossy().into_owned(), topology: None })
 }
 
 /// Height change field of an edit, for points that are not landscape vertices (collision): the
@@ -134,6 +186,8 @@ pub struct SetReport {
     pub paint: Option<crate::landscape_paint::PaintReport>,
     /// Ground material → the shape material its collision gets (footsteps, sounds), when painted.
     pub shape_materials: Vec<(String, String)>,
+    /// Sectors whose collision was rebuilt from the edited ground where the edit bends it.
+    pub dense_sectors: usize,
 }
 
 /// A collision sector of the landscape: entity name, translation (cm), archive entry and bytes.
@@ -177,60 +231,65 @@ fn shape_table(names: &[String], arch_sub: &[u32], all: &[&(crate::nxs::Xcom, Ve
 /// A sector re-cooked with its triangles regrouped by shape material (one stream each, ordered
 /// by the material's name as the shipped sectors are), heights moved by `off` (metres, local).
 fn rebuild_sector(x: &crate::nxs::Xcom, shapes: &[Vec<u8>], off: &dyn Fn(f32, f32, f32) -> f32) -> Result<Vec<u8>> {
-    use crate::nxs::{ShapeMaterial, SHAPE_MATERIALS};
-    let mut groups: std::collections::BTreeMap<&str, (u8, Vec<V3>, Vec<[u32; 3]>, Vec<u16>)> = Default::default();
-    for (si, m) in x.meshes.iter().enumerate() {
-        let verts: Vec<V3> = m.verts.iter().map(|v| [v[0], v[1] + off(v[0], v[1], v[2]), v[2]]).collect();
-        for (ti, t) in m.tris.iter().enumerate() {
-            let s = shapes[si][ti];
-            let e = groups.entry(SHAPE_MATERIALS.get(s as usize).copied().unwrap_or("none")).or_insert((s, vec![], vec![], vec![]));
-            let base = e.1.len() as u32;
-            for &i in t { e.1.push(verts[i as usize]); }
-            e.2.push([base, base + 1, base + 2]);
-            e.3.push(m.materials.as_ref().and_then(|ms| ms.get(ti).copied()).unwrap_or(0));
-        }
-    }
-    let mut meshes = vec![];
-    let mut shape_materials = vec![];
-    let mut boxes = vec![];
-    for (s, verts, tris, mats) in groups.values() {
-        let mesh = crate::cook::cook(verts, tris, mats)?;
-        boxes.extend(crate::gr01::bbox_bytes([0, 1, 2].map(|k| mesh.aabb[k] * 100.0 - 0.01), [0, 1, 2].map(|k| mesh.aabb[3 + k] * 100.0 + 0.01)));
-        meshes.push(mesh);
-        shape_materials.push(x.shape_materials.iter().find(|o| o.material == *s).copied().unwrap_or(ShapeMaterial { material: *s, ignored_by_trace_ray: 0, no_collision: 0, no_response: 0 }));
-    }
-    let mut resource = x.resource.clone();
-    let sb = resource.section.root.props.iter_mut().find(|p| p.name == "SubBoundaries").context("collision sector without SubBoundaries")?;
-    let crate::gr01::Value::Raw(raw) = &mut sb.value else { anyhow::bail!("SubBoundaries is not raw") };
-    let head = raw.first().copied().unwrap_or(1);
-    let mut v = vec![head];
-    v.extend((meshes.len() as u32).to_le_bytes());
-    v.extend(boxes);
-    *raw = v;
-    Ok(crate::nxs::write_xcom(&crate::nxs::Xcom { resource, meshes, shape_materials }))
+    crate::landscape_col::rebuild(x, shapes, off, None, &[])
 }
 
 /// Blender's welded positions (and, optionally, the editor's paint: archive submesh per triangle)
-/// → the patched landscape and every collision sector the edit moves or repaints.
+/// → the patched landscape and every collision sector the edit moves or repaints. Where an edit
+/// bends the ground inside a coarse collision triangle, the collision there is rebuilt from the
+/// edited render triangles (`landscape_col`).
 pub fn set(g: &GameCtx, positions_bin: &Path, paint_bin: Option<&Path>) -> Result<(SetReport, Vec<(String, Vec<u8>)>)> {
+    set_with(g, positions_bin, paint_bin, true)
+}
+
+/// `set`, with the dense collision rebuild on or off (off = only the coarse vertices move; for
+/// comparisons).
+pub fn set_with(g: &GameCtx, positions_bin: &Path, paint_bin: Option<&Path>, dense: bool) -> Result<(SetReport, Vec<(String, Vec<u8>)>)> {
+    set_full(g, positions_bin, paint_bin, None, dense)
+}
+
+/// The base an edit of `n` welded vertices applies to: the given topology, else the archive, else
+/// (when the counts say so) the topology installed with the current ground.
+fn base_for(g: &GameCtx, e: &str, src: &[u8], n: usize, topology: Option<&crate::landscape_topo::Spec>) -> Result<crate::landscape_topo::Base> {
+    if let Some(t) = topology { return crate::landscape_topo::apply(src, t); }
+    let b = crate::landscape_topo::archive_base(src)?;
+    if n != b.welded.len() {
+        if let Some(t) = installed_topology(g, e)? { if t.result_vertices as usize == n { return crate::landscape_topo::apply(src, &t); } }
+    }
+    Ok(b)
+}
+
+fn read_positions_bin(positions_bin: &Path) -> Result<Vec<V3>> {
     let d = std::fs::read(positions_bin).with_context(|| format!("read {}", positions_bin.display()))?;
+    ensure!(d.len() >= 4, "positions file is empty");
     let n = u32::from_le_bytes(d[..4].try_into()?) as usize;
     ensure!(d.len() == 4 + n * 12, "positions file is {} bytes, expected {}", d.len(), 4 + n * 12);
     let f = |i: usize| f32::from_le_bytes(d[4 + i * 4..8 + i * 4].try_into().unwrap());
-    let new_uniq: Vec<V3> = (0..n).map(|i| [f(i * 3), f(i * 3 + 1), f(i * 3 + 2)]).collect();
+    Ok((0..n).map(|i| [f(i * 3), f(i * 3 + 1), f(i * 3 + 2)]).collect())
+}
+
+/// `set` with an explicit topology edit (`landscape_topo`; None: the archive's topology, or the
+/// installed one when the vertex count matches it). The topology file goes into the output next to
+/// the landscape, so the ground can be read back.
+pub fn set_full(g: &GameCtx, positions_bin: &Path, paint_bin: Option<&Path>, topology: Option<&crate::landscape_topo::Spec>, dense: bool) -> Result<(SetReport, Vec<(String, Vec<u8>)>)> {
+    let new_uniq = read_positions_bin(positions_bin)?;
     let e = entry(g)?;
     let src = g.read_archive(&e)?;
-    let m = crate::xmsh_geom::decode(&src)?;
-    let (uniq, map) = weld(&m.positions);
-    ensure!(new_uniq.len() == uniq.len(), "the landscape in Blender has {} vertices, the game's {}: move vertices, do not add or delete them", new_uniq.len(), uniq.len());
+    let base = base_for(g, &e, &src, new_uniq.len(), topology)?;
+    let src = &base.bytes;
+    let m = crate::xmsh_geom::decode(src)?;
+    let map = &base.map;
+    ensure!(new_uniq.len() == base.welded.len(), "the landscape in Blender has {} vertices, the game's {}: move vertices, do not add or delete them", new_uniq.len(), base.welded.len());
     // Blender's metres → centimetres round trip is not exact: moves under half a millimetre are noise.
     let new_file: Vec<V3> = map.iter().enumerate().map(|(i, &u)| { let (a, b) = (m.positions[i], new_uniq[u as usize]); if (0..3).all(|k| (a[k] - b[k]).abs() < 0.05) { a } else { b } }).collect();
-    let (mut bytes, rep) = terrain::apply_positions(&src, &new_file)?;
+    let (mut bytes, rep) = terrain::apply_positions(src, &new_file)?;
     let arch_sub = crate::landscape_paint::sub_of(&m);
     let paint = match paint_bin {
         Some(p) => {
             let v = crate::landscape_paint::read_paint(p)?;
-            ensure!(v.len() == arch_sub.len(), "paint has {} triangles, the landscape {}", v.len(), arch_sub.len());
+            ensure!(v.len() == base.welded_tris.len(), "paint has {} triangles, the landscape {}", v.len(), base.welded_tris.len());
+            // Welded (editor) order -> this file's triangle order (the same for the archive).
+            let v: Vec<u32> = base.tri_welded.iter().map(|&w| v[w as usize]).collect();
             Some(v).filter(|v| *v != arch_sub)
         }
         None => None,
@@ -243,15 +302,17 @@ pub fn set(g: &GameCtx, positions_bin: &Path, paint_bin: Option<&Path>) -> Resul
         report.paint = Some(pr);
     }
     let mut files = vec![(g.rel(&e)?, bytes)];
+    if let Some(spec) = &base.spec { files.push((sidecar(g, &e)?, crate::landscape_topo::write(spec))); }
     if rep.boundary_changed {
         // Higher than the island's top or past its edge: the landscape entity's boxes and its layer's
         // ContextBox grow with it, or the engine culls the new ground.
         let (lo, hi) = aabb(&new_file);
         files.push(grow_layer(g, lo, hi)?);
     }
-    if rep.moved_vertices == 0 && paint.is_none() { return Ok((report, files)); }
+    if rep.moved_vertices == 0 && paint.is_none() && base.holes.is_empty() { return Ok((report, files)); }
 
     let tris: Vec<[u32; 3]> = m.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
+    let densify = if dense && (rep.moved_vertices > 0 || !base.holes.is_empty()) { Some(crate::landscape_col::Dense::new(&m.positions, &new_file, &tris, base.holes.clone())) } else { None };
     let field = Field::new(m.positions.clone(), &new_file, tris);
     let secs = sectors(g)?;
     // With paint: every sector's triangles matched to the render triangles they lie on, once.
@@ -267,6 +328,34 @@ pub fn set(g: &GameCtx, positions_bin: &Path, paint_bin: Option<&Path>) -> Resul
     for (si, s) in secs.iter().enumerate() {
         let p = s.p;
         let off = |x: f32, y: f32, z: f32| field.at(p[0] + x * 100.0, p[1] + y * 100.0, p[2] + z * 100.0) / 100.0;
+        if let Some(dense) = &densify {
+            let own;
+            let (x, mt) = match parsed.get(si) { Some((x, mt)) => (x, Some(mt)), None => { own = crate::nxs::read_xcom(&s.src)?; (&own, None) } };
+            if let Some(plan) = dense.plan(x, p, &|wx, wy, wz| field.at(wx, wy, wz)) {
+                ensure!(s.rot_ok, "{}: collision sector is rotated or scaled; not supported", s.name);
+                // Surfaces: the kept triangles as with paint (or their own), the added ones the
+                // repainted material's, else the surface of the collision triangle they replace.
+                let shapes: Vec<Vec<u8>> = (0..x.meshes.len()).map(|k| {
+                    let own = x.shape_materials.get(k).map(|s| s.material).unwrap_or(0);
+                    (0..x.meshes[k].tris.len()).map(|i| match (&paint, mt.and_then(|mt| mt[k][i])) {
+                        (Some(paint), Some(t)) if paint[t as usize] != arch_sub[t as usize] => table[paint[t as usize] as usize],
+                        _ => own,
+                    }).collect()
+                }).collect();
+                let up = crate::landscape_col::up_winding(x);
+                let extra: Vec<([V3; 3], u8)> = plan.add.iter().zip(&plan.add_from).map(|(&t, &(k, i))| {
+                    let c = dense.tris[t as usize].map(|v| { let q = new_file[v as usize]; [(q[0] - p[0]) / 100.0, (q[1] - p[1]) / 100.0, (q[2] - p[2]) / 100.0] });
+                    // The render file faces up as (c-a)x(b-a); match the sector's own winding.
+                    let tri = if up > 0.0 { [c[0], c[2], c[1]] } else { c };
+                    let shape = match &paint { Some(paint) if paint[t as usize] != arch_sub[t as usize] => table[paint[t as usize] as usize], _ => shapes[k][i] };
+                    (tri, shape)
+                }).collect();
+                files.push((g.rel(&s.entry)?, crate::landscape_col::rebuild(x, &shapes, &off, Some(&plan.remove), &extra)?));
+                report.sectors.push(format!("{} (dense: {} coarse triangles rebuilt from {} ground triangles, coarse patch was off by up to {:.0} cm)", s.name, plan.removed, plan.add.len(), plan.worst_cm));
+                report.dense_sectors += 1;
+                continue;
+            }
+        }
         if let (Some(paint), Some((x, mt))) = (&paint, parsed.get(si)) {
             let mut changed = 0;
             let shapes: Vec<Vec<u8>> = (0..x.meshes.len()).map(|k| {
@@ -293,9 +382,236 @@ pub fn set(g: &GameCtx, positions_bin: &Path, paint_bin: Option<&Path>) -> Resul
     Ok((report, files))
 }
 
+/// How well the collision follows the ground over an edit.
+#[derive(serde::Serialize, Debug, Default)]
+pub struct GapReport {
+    /// Points checked: 4 per render triangle (not steeper than 60°) within 20 m of a vertex moved by more than 1 cm.
+    pub samples: usize,
+    /// Points with no collision triangle under them (e.g. under the town's shell).
+    pub without_collision: usize,
+    /// Edited triangles steeper than 60° (walls), not measured vertically.
+    pub steep_skipped: usize,
+    /// Largest and 99th-percentile |collision - ground| over the edited area (cm), after the set.
+    pub max_cm: f32,
+    pub p99_cm: f32,
+    /// The same points on the unedited game: how far the shipped collision already was from the shipped ground.
+    pub vanilla_max_cm: f32,
+    /// Largest |gap after - gap in the shipped game| (cm): what the edit itself adds.
+    pub added_max_cm: f32,
+    /// Points where the shipped collision already followed the shipped ground (within 20 cm), and the
+    /// largest gap after the set there: the walkable ground the edit must not break.
+    pub followed_samples: usize,
+    pub followed_max_cm: f32,
+    /// Every collision triangle of the edited area, walls included: the 3D distance of its points to
+    /// the nearest ground triangle (cm), after the set and in the shipped game, and the points farther
+    /// than 20 cm from any ground (`apart`; in the shipped game too: `vanilla_apart`).
+    pub dist_max_cm: f32,
+    pub dist_vanilla_max_cm: f32,
+    pub apart: usize,
+    pub vanilla_apart: usize,
+    pub dist_worst_at: [f32; 3],
+    /// Where the largest gap is (x, z cm).
+    pub worst_at: [f32; 2],
+    /// The worst points: x, z, ground before, collision before, ground after, collision after (cm).
+    pub worst: Vec<[f32; 6]>,
+}
+
+/// The gap between the collision and the render ground over the area `positions_bin` edits, with
+/// the collision sectors of `files` (the output of `set`) in place of the shipped ones.
+pub fn gap_report(g: &GameCtx, positions_bin: &Path, files: &[(String, Vec<u8>)]) -> Result<GapReport> { gap_report_full(g, positions_bin, None, files) }
+
+/// `gap_report` for an edit with a topology (see `set_full`).
+pub fn gap_report_full(g: &GameCtx, positions_bin: &Path, topology: Option<&crate::landscape_topo::Spec>, files: &[(String, Vec<u8>)]) -> Result<GapReport> {
+    let new_uniq = read_positions_bin(positions_bin)?;
+    let e = entry(g)?;
+    let base = base_for(g, &e, &g.read_archive(&e)?, new_uniq.len(), topology)?;
+    let m = crate::xmsh_geom::decode(&base.bytes)?;
+    let map = &base.map;
+    ensure!(new_uniq.len() == base.welded.len(), "positions do not match the landscape");
+    let new_file: Vec<V3> = map.iter().map(|&u| new_uniq[u as usize]).collect();
+    let secs = sectors(g)?;
+    let (mut now, mut was) = (vec![], vec![]);
+    for s in &secs {
+        let x0 = crate::nxs::read_xcom(&s.src)?;
+        crate::landscape_col::Surface::from_xcom(&x0, s.p, &mut was);
+        let rel = g.rel(&s.entry)?;
+        match files.iter().find(|(r, _)| *r == rel) {
+            Some((_, b)) => crate::landscape_col::Surface::from_xcom(&crate::nxs::read_xcom(b)?, s.p, &mut now),
+            None => crate::landscape_col::Surface::from_xcom(&x0, s.p, &mut now),
+        }
+    }
+    let (now, was) = (crate::landscape_col::Surface::new(now), crate::landscape_col::Surface::new(was));
+    let mut rep = GapReport::default();
+    let mut gaps = vec![];
+    // The edited area: 10 m cells holding a vertex moved by more than 1 cm, and two cells around them
+    // (collision triangles reach past the moved ground).
+    let key = |x: f32, z: f32| ((x / 1000.0).floor() as i32, (z / 1000.0).floor() as i32);
+    let mut area = std::collections::HashSet::new();
+    for (a, b) in m.positions.iter().zip(&new_file) {
+        if (a[1] - b[1]).abs() > 1.0 { let (cx, cz) = key(a[0], a[2]); for dx in -2..=2 { for dz in -2..=2 { area.insert((cx + dx, cz + dz)); } } }
+    }
+    for t in m.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]) {
+        let (a, b) = (t.map(|i| m.positions[i as usize]), t.map(|i| new_file[i as usize]));
+        if !area.contains(&key((b[0][0] + b[1][0] + b[2][0]) / 3.0, (b[0][2] + b[1][2] + b[2][2]) / 3.0)) { continue; }
+        // Walls and steep faces: a vertical gap means nothing there (walking happens on the rest).
+        let (u, v) = ([b[1][0] - b[0][0], b[1][1] - b[0][1], b[1][2] - b[0][2]], [b[2][0] - b[0][0], b[2][1] - b[0][1], b[2][2] - b[0][2]]);
+        let nrm = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+        if nrm[1].abs() < 0.5 * (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt() { rep.steep_skipped += 1; continue; }
+        for w in [[1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], [0.7, 0.15, 0.15], [0.15, 0.7, 0.15], [0.15, 0.15, 0.7f32]] {
+            let at = |p: &[V3; 3]| -> V3 { [0, 1, 2].map(|c| w[0] * p[0][c] + w[1] * p[1][c] + w[2] * p[2][c]) };
+            let (pa, pb) = (at(&a), at(&b));
+            rep.samples += 1;
+            let (Some(cn), Some(cw)) = (now.height_near(pb[0], pb[2], pb[1]), was.height_near(pa[0], pa[2], pa[1])) else { rep.without_collision += 1; continue };
+            let (gap, gap0) = ((cn - pb[1]).abs(), (cw - pa[1]).abs());
+            if gap > rep.max_cm { rep.max_cm = gap; rep.worst_at = [pb[0], pb[2]]; }
+            rep.vanilla_max_cm = rep.vanilla_max_cm.max(gap0);
+            if gap0 <= 20.0 { rep.followed_samples += 1; rep.followed_max_cm = rep.followed_max_cm.max(gap); }
+            rep.added_max_cm = rep.added_max_cm.max(((cn - pb[1]) - (cw - pa[1])).abs());
+            gaps.push(gap);
+            if gap0 <= 20.0 { rep.worst.push([pb[0], pb[2], pa[1], cw, pb[1], cn]); }
+        }
+    }
+    let in_area = |x: f32, z: f32| area.contains(&key(x, z));
+    let tri_list: Vec<[u32; 3]> = m.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
+    let ground_now = crate::landscape_col::Dense::new(&new_file, &new_file, &tri_list, vec![]);
+    let ground_was = crate::landscape_col::Dense::new(&m.positions, &m.positions, &tri_list, vec![]);
+    // Collision -> ground ("walking in the air"): every collision point near some ground triangle.
+    for (surf, ground, vanilla) in [(&now, &ground_now, false), (&was, &ground_was, true)] {
+        for q in surf.samples(50.0, &in_area, false) {
+            let d = ground.distance(q, 300.0).unwrap_or(f32::MAX);
+            if vanilla { if d > 20.0 { rep.vanilla_apart += 1; } if d < f32::MAX { rep.dist_vanilla_max_cm = rep.dist_vanilla_max_cm.max(d); } continue; }
+            if d > 20.0 { rep.apart += 1; }
+            if d < f32::MAX && d > rep.dist_max_cm { rep.dist_max_cm = d; rep.dist_worst_at = q; }
+        }
+    }
+    gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    rep.worst.sort_by(|a, b| (b[5] - b[4]).abs().partial_cmp(&(a[5] - a[4]).abs()).unwrap());
+    rep.worst.truncate(12);
+    rep.p99_cm = gaps.get((gaps.len() as f32 * 0.99) as usize).copied().unwrap_or(0.0);
+    Ok(rep)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ground the game has installed now (an edit the owner walks on), set again: with the dense
+    /// collision the collision follows the ground over the whole edited area to within 20 cm; the
+    /// coarse patch alone does not. Nothing is written into the game.
+    #[test]
+    fn installed_edit_collision_follows_the_ground() {
+        let Some(g) = crate::game::test_game() else { eprintln!("skip: RISEN_GAME not set"); return };
+        let tmp = std::env::temp_dir().join(format!("rc-gap-{}", std::process::id()));
+        let r = get(&g, &tmp, true).unwrap();
+        let d = std::fs::read(&r.geometry).unwrap();
+        let n = u32::from_le_bytes(d[..4].try_into().unwrap()) as usize;
+        let pos = tmp.join("pos.bin");
+        std::fs::write(&pos, &d[..4 + n * 12]).unwrap();
+        let (rc, coarse) = set_with(&g, &pos, None, false).unwrap();
+        let (rd, dense) = set_with(&g, &pos, None, true).unwrap();
+        if rc.moved_vertices == 0 { eprintln!("skip: no ground edit installed"); return; }
+        let (gc, gd) = (gap_report(&g, &pos, &coarse).unwrap(), gap_report(&g, &pos, &dense).unwrap());
+        eprintln!("coarse: {gc:?}
+dense:  {gd:?}
+dense sectors {} {:?}", rd.dense_sectors, rd.sectors);
+        assert!(gd.samples > 0);
+        assert!(gd.max_cm < 20.0, "collision is {} cm off the ground at {:?}", gd.max_cm, gd.worst_at);
+        assert!(gd.dist_max_cm < 20.0 && gd.apart == 0, "collision floats {} cm off the ground at {:?} ({} points)", gd.dist_max_cm, gd.dist_worst_at, gd.apart);
+        // The coarse patch alone leaves collision in the air on such edits (players run on nothing).
+        eprintln!("coarse patch: {} collision points over 20 cm from the ground, up to {} cm", gc.apart, gc.dist_max_cm);
+        // The render mesh is the same either way.
+        assert!(coarse[0].1 == dense[0].1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Topology: a patch near Harbour subdivided, a hole cut in its middle and the ground there
+    /// raised. Set on a scratch game, the landscape has the new counts and the topology file goes
+    /// with it; read back (`get current`) the heights, paint and topology come out as set; a plain
+    /// header-less set of those positions (what the Blender add-on sends) finds the installed
+    /// topology and gives the same files; the collision has nothing over the hole and follows the
+    /// raised ground. Writes a fixture for the editor's own replay (RC_TOPO_FIXTURE).
+    #[test]
+    fn subdivided_ground_with_a_hole_round_trips() {
+        let Some(g) = crate::game::test_game() else { eprintln!("skip: RISEN_GAME not set"); return };
+        let root = scratch_game(&g, "topo");
+        let vanilla = open(&root);
+        let e = entry(&vanilla).unwrap();
+        let src = vanilla.read_archive(&e).unwrap();
+        let arch = crate::landscape_topo::archive_base(&src).unwrap();
+        let (cx, cz) = (-18130.0f32, -14887.0f32);
+        let centre = |b: &crate::landscape_topo::Base, t: usize| { let p = b.welded_tris[t].map(|i| b.welded[i as usize]); [(p[0][0] + p[1][0] + p[2][0]) / 3.0, (p[0][2] + p[1][2] + p[2][2]) / 3.0] };
+        let near = |b: &crate::landscape_topo::Base, r: f32| (0..b.welded_tris.len()).filter(|&t| { let c = centre(b, t); (c[0] - cx).hypot(c[1] - cz) < r }).map(|t| t as u32).collect::<Vec<_>>();
+        let sub1 = near(&arch, 1500.0);
+        assert!(sub1.len() > 10, "{}", sub1.len());
+        let op1 = crate::landscape_topo::Op { kind: crate::landscape_topo::KIND_SUBDIVIDE, tris: sub1 };
+        let mid = crate::landscape_topo::apply(&src, &crate::landscape_topo::seal(&src, vec![op1.clone()]).unwrap()).unwrap();
+        let hole = near(&mid, 250.0);
+        assert!(!hole.is_empty());
+        let spec = crate::landscape_topo::seal(&src, vec![op1, crate::landscape_topo::Op { kind: crate::landscape_topo::KIND_REMOVE, tris: hole.clone() }]).unwrap();
+        let base = crate::landscape_topo::apply(&src, &spec).unwrap();
+        assert!(base.welded.len() > arch.welded.len() && base.welded_tris.len() != arch.welded_tris.len());
+        // Fixture for the editor's C# replay (same numbering, same checksum).
+        if let Some(dir) = std::env::var_os("RC_TOPO_FIXTURE") {
+            let dir = Path::new(&dir);
+            get(&vanilla, dir, false).unwrap();
+            std::fs::write(dir.join("topology.bin"), crate::landscape_topo::write(&spec)).unwrap();
+        }
+        // Raise the ground around the hole by 2 m (a mound with a cellar mouth).
+        let raised: Vec<V3> = base.welded.iter().map(|p| { let d = (p[0] - cx).hypot(p[2] - cz); if d < 1000.0 { [p[0], p[1] + 200.0 * (1.0 - d / 1000.0), p[2]] } else { *p } }).collect();
+        let (pos_bin, paint_bin) = (root.join("pos.bin"), root.join("paint.bin"));
+        write_positions(&pos_bin, &raised);
+        let mut pb = (base.welded_sub.len() as u32).to_le_bytes().to_vec();
+        for s in &base.welded_sub { pb.extend(s.to_le_bytes()); }
+        std::fs::write(&paint_bin, pb).unwrap();
+        let (rep, files) = set_full(&vanilla, &pos_bin, Some(&paint_bin), Some(&spec), true).unwrap();
+        eprintln!("topology: {} -> {} vertices, {} -> {} triangles; sectors {:?}", arch.welded.len(), base.welded.len(), arch.welded_tris.len(), base.welded_tris.len(), rep.sectors);
+        let side = sidecar(&vanilla, &e).unwrap();
+        assert!(files.iter().any(|f| f.0 == side));
+        let geo = crate::xmsh_geom::decode(&files[0].1).unwrap();
+        assert_eq!(geo.indices.len() / 3, base.welded_tris.len());
+        assert!(crate::gr01::Resource::parse(&files[0].1).unwrap().write() == files[0].1);
+        // Install into the scratch game and read back.
+        crate::export::write_all(&root, &files).unwrap();
+        let modded = open(&root);
+        let out = root.join("get1");
+        let r = get(&modded, &out, true).unwrap();
+        assert_eq!(r.vertices, base.welded.len());
+        assert_eq!(r.triangles, base.welded_tris.len());
+        assert!(r.topology.is_some());
+        let back = read_positions(&r.geometry);
+        // Vertices only the removed triangles used are in no file any more: they read back as the base had them.
+        let mut used = vec![false; base.welded.len()];
+        for t in &base.welded_tris { for &i in t { used[i as usize] = true; } }
+        let worst = back.iter().zip(&raised).zip(&used).filter(|(_, &u)| u).map(|((c, w), _)| (0..3).map(|k| (c[k] - w[k]).abs()).fold(0.0, f32::max)).fold(0.0, f32::max);
+        assert!(worst < 0.05, "heights read back differ by {worst} cm");
+        assert_eq!(crate::landscape_topo::read(&std::fs::read(r.topology.as_ref().unwrap()).unwrap()).unwrap(), spec);
+        // What the Blender add-on does: header-less positions of the new count, no topology given.
+        let bin2 = root.join("pos2.bin");
+        write_positions(&bin2, &back);
+        let (_, again) = set_full(&modded, &bin2, Some(&paint_bin), None, true).unwrap();
+        assert_eq!(again.len(), files.len());
+        for (x, y) in again.iter().zip(&files) { assert!(x.0 == y.0 && x.1 == y.1, "{} differs when set again without the topology", x.0); }
+        // No collision over the hole; the raised ground is followed.
+        let secs = sectors(&modded).unwrap();
+        let mut tris = vec![];
+        for s in &secs {
+            let rel = modded.rel(&s.entry).unwrap();
+            let b = files.iter().find(|f| f.0 == rel).map(|f| f.1.clone()).unwrap_or(s.src.clone());
+            crate::landscape_col::Surface::from_xcom(&crate::nxs::read_xcom(&b).unwrap(), s.p, &mut tris);
+        }
+        let surf = crate::landscape_col::Surface::new(tris);
+        for &t in &hole {
+            let p = mid.welded_tris[t as usize].map(|i| mid.welded[i as usize]);
+            let c = [0, 1, 2].map(|k| (p[0][k] + p[1][k] + p[2][k]) / 3.0);
+            let h = surf.height_near(c[0], c[2], c[1]);
+            assert!(h.map_or(true, |h| (h - c[1]).abs() > 300.0), "collision left over the hole at {c:?}: {h:?}");
+        }
+        let gap = gap_report_full(&modded, &bin2, None, &files).unwrap();
+        eprintln!("gap {gap:?}");
+        assert!(gap.dist_max_cm < 20.0 && gap.apart == 0, "{gap:?}");
+        drop((vanilla, modded));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// A hill made through the Blender path (welded positions) patches the mesh like the in-game-
     /// proven bump, and moves the collision sectors under it by the same height.
@@ -508,12 +824,16 @@ mod paint_tests {
         // Collision: every rebuilt sector against the archive's, triangle by triangle (by centre).
         let secs = sectors(&vanilla).unwrap();
         let field = Field::new(m.positions.clone(), &m.positions, m.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect());
+        // The raised ground, for collision triangles that are ground triangles now (dense rebuild).
+        let raised_file: Vec<V3> = map.iter().map(|&u| raised[u as usize]).collect();
+        let field_new = Field::new(raised_file.clone(), &raised_file, m.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect());
         let mut rebuilt = 0;
         for (rel, bytes) in &files {
             let Some(s) = secs.iter().find(|s| vanilla.rel(&s.entry).unwrap() == *rel) else { continue };
             let (old, new) = (crate::nxs::read_xcom(&s.src).unwrap(), crate::nxs::read_xcom(bytes).unwrap());
             let count = |x: &crate::nxs::Xcom| x.meshes.iter().map(|m| m.tris.len()).sum::<usize>();
-            assert_eq!(count(&old), count(&new), "{}", s.name);
+            let dense = rep.sectors.iter().any(|x| x.starts_with(&format!("{} (dense", s.name)));
+            if !dense { assert_eq!(count(&old), count(&new), "{}", s.name); }
             if old.shape_materials == new.shape_materials && new.meshes.iter().zip(&old.meshes).all(|(a, b)| a.tris == b.tris) { continue; }
             rebuilt += 1;
             let key = |x: &crate::nxs::Xcom| -> Vec<([i32; 2], u8, f32)> {
@@ -524,8 +844,15 @@ mod paint_tests {
             };
             let before: HashMap<[i32; 2], (u8, f32)> = key(&old).into_iter().map(|(c, s, y)| (c, (s, y))).collect();
             let (mut kept, mut sanded) = (0, 0);
-            for (c, shape, _) in key(&new) {
-                let Some(&(was, y_old)) = before.get(&c) else { continue };
+            for (c, shape, y_new) in key(&new) {
+                let Some(&(was, y_old)) = before.get(&c) else {
+                    // A ground triangle brought in by the dense rebuild: the surface of its own paint.
+                    assert!(dense, "{}: a collision triangle appeared in a sector that was not rebuilt", s.name);
+                    if let Some(t) = field_new.tri_at(s.p[0] + c[0] as f32, s.p[1] + y_new, s.p[2] + c[1] as f32) {
+                        if paint[t as usize] != arch[t as usize] { assert_eq!(shape, sand, "{}: an added repainted triangle", s.name); sanded += 1; }
+                    }
+                    continue
+                };
                 // Exactly: a collision triangle takes the new surface iff the render triangle it lies on was repainted.
                 match field.tri_at(s.p[0] + c[0] as f32, s.p[1] + y_old, s.p[2] + c[1] as f32) {
                     Some(t) if paint[t as usize] != arch[t as usize] => { assert_eq!(shape, sand, "{}: a repainted triangle did not follow", s.name); sanded += 1; }
@@ -557,3 +884,4 @@ mod paint_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+

@@ -305,9 +305,11 @@ mod tests {
     fn cooks_like_the_engine() {
         let Some(g) = crate::game::test_game() else { eprintln!("skip: RISEN_GAME not set"); return };
         let (mut n, mut same_eps, mut same_aabb, mut mass_ok, mut edge_ok, mut edge_tot) = (0, 0, 0, 0, 0usize, 0usize);
-        for e in g.entries_with_suffix("._xcom").into_iter().step_by(3) {
+        // The archives' own files only: mods installed into the game add loose ones and would shift the sample.
+        let shipped: Vec<String> = g.entries_with_suffix("._xcom").into_iter().filter(|e| g.read_archive(e).is_ok()).collect();
+        for e in shipped.into_iter().step_by(3) {
             if e.to_lowercase().ends_with("_cv._xcom") { continue; }
-            let x = nxs::read_xcom(&g.read(&e).unwrap().0).unwrap();
+            let x = nxs::read_xcom(&g.read_archive(&e).unwrap()).unwrap();
             for m in &x.meshes {
                 let ours = cook(&m.verts, &m.tris, m.materials.as_deref().unwrap_or(&[])).unwrap();
                 n += 1;

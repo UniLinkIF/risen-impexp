@@ -48,7 +48,7 @@ Bytes, 2009, рушій Genome) у **Blender 5.1+**.
 ## Встановлення
 
 1. Blender 5.1 або новіший.
-2. *Edit → Preferences → Get Extensions → ⌄ → Install from Disk…* → `risen_impexp-0.9.3.zip`
+2. *Edit → Preferences → Get Extensions → ⌄ → Install from Disk…* → `risen_impexp-0.9.4.zip`
    (зі сторінки Releases).
 3. У налаштуваннях аддона вкажіть **Risen game folder** (ту, де лежить `bin\Risen.exe`; шлях Steam
    уже підставлено). За бажанням — папку кешу й папку для пакетів модів.

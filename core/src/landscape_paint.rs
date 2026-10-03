@@ -34,15 +34,15 @@ use std::path::Path;
 
 type V3 = [f32; 3];
 
-const V_HEADER: usize = 0x80;
-const V_STRIDE: usize = 0x90;
-const I_HEADER: usize = 0xBC;
-const I_FORMAT: usize = 0xC4;
-const V_START: usize = 0xCC;
+pub(crate) const V_HEADER: usize = 0x80;
+pub(crate) const V_STRIDE: usize = 0x90;
+pub(crate) const I_HEADER: usize = 0xBC;
+pub(crate) const I_FORMAT: usize = 0xC4;
+pub(crate) const V_START: usize = 0xCC;
 /// Triangles per culling leaf: the shipped landscape's median leaf holds 12, p90 31.
 const LEAF: usize = 16;
 
-fn u32_at(d: &[u8], at: usize) -> Result<u32> { d.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).ok_or_else(|| anyhow::anyhow!("u32 past end at 0x{at:x}")) }
+pub(crate) fn u32_at(d: &[u8], at: usize) -> Result<u32> { d.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).ok_or_else(|| anyhow::anyhow!("u32 past end at 0x{at:x}")) }
 
 /// `paint.bin`: `u32 nt · u32 submesh[nt]`, archive submesh index per triangle in archive order
 /// (the order and numbering of `landscape-get`'s `landscape.bin`).
@@ -63,11 +63,11 @@ pub fn sub_of(m: &MeshGeometry) -> Vec<u32> {
 
 /// One culling node: triangles [first, first + count) of the submesh's new order, and the size of
 /// its subtree (itself included).
-struct Node { first: usize, count: usize, size: usize }
+pub(crate) struct Node { pub first: usize, pub count: usize, pub size: usize }
 
 /// Spatial order of `tris` and the preorder tree over it: split at the median along the longer
 /// XZ extent of the centres, twice, so a node has up to 4 children; leaves of at most `LEAF`.
-fn build_tree(tris: &mut [u32], centre: &dyn Fn(u32) -> [f32; 2], first: usize, out: &mut Vec<Node>) {
+pub(crate) fn build_tree(tris: &mut [u32], centre: &dyn Fn(u32) -> [f32; 2], first: usize, out: &mut Vec<Node>) {
     let me = out.len();
     out.push(Node { first, count: tris.len(), size: 1 });
     if tris.len() <= LEAF { return; }
@@ -97,7 +97,7 @@ fn build_tree(tris: &mut [u32], centre: &dyn Fn(u32) -> [f32; 2], first: usize, 
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct PaintReport { pub repainted_triangles: usize, pub vertices_before: usize, pub vertices_after: usize, pub materials: usize }
 
-fn long_prop(body: &mut crate::gr01::Body, name: &str, v: u32) -> Result<()> {
+pub(crate) fn long_prop(body: &mut crate::gr01::Body, name: &str, v: u32) -> Result<()> {
     let p = body.props.iter_mut().find(|p| p.name == name).with_context(|| format!("submesh without {name}"))?;
     p.value = Value::Raw(v.to_le_bytes().to_vec());
     Ok(())

@@ -292,7 +292,7 @@ pub fn build(g: &crate::game::GameCtx, spec: &ActorSpec) -> Result<(ActorReport,
         // Texture names follow a game material template (its stem length), and that template is
         // written as the material's ._xmat too, so the shader knows alpha test and specular.
         let t = if m.alpha_test.is_some() { &crate::export::ALPHA_TEST } else if m.specular.is_some() { &crate::export::OPAQUE_SPECULAR } else { &crate::export::OPAQUE };
-        let stem = crate::export::stem_for(&name, t.stem.len());
+        let stem = crate::export::stem_for(&crate::export::material_key(&name, &[&m.diffuse, &m.normal, &m.specular]), t.stem.len());
         let mut tex = |png: &Option<String>, suffix: &str, kind: u8| -> Result<Option<String>> {
             let Some(p) = png else { return Ok(None) };
             let (px, w, h) = crate::ximg_write::load_png(std::path::Path::new(p)).with_context(|| format!("material {name}: {p}"))?;

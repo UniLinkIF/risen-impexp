@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "risen_impexp"
-version = "0.9.3"
+version = "0.9.4"
 name = "Risen ImpExp"
 tagline = "Risen 1 models, actors, motions, collision and ground"
 maintainer = "BlenderMod"
