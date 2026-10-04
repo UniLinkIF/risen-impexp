@@ -49,7 +49,7 @@ object placements.
 ## Install
 
 1. Blender 5.1 or newer.
-2. *Edit → Preferences → Get Extensions → ⌄ → Install from Disk…* → `risen_impexp-0.9.4.zip`
+2. *Edit → Preferences → Get Extensions → ⌄ → Install from Disk…* → `risen_impexp-0.9.5.zip`
    (from the Releases page).
 3. In the add-on's preferences set **Risen game folder** (the one with `bin\Risen.exe`; the Steam
    default is filled in). Optional: a cache folder and a folder for mod packages.
@@ -86,6 +86,8 @@ Scale: Risen works in centimetres; the add-on imports at 0.01 (metres) and expor
 
 - Materials of new meshes are made from game material templates: opaque, opaque with specular, or
   alpha test (cut-off from the Alpha link); no other shader effects.
+- A new actor material always gets a skinned shader (the hero's, with specular or alpha test); missing normal or
+  specular maps are written flat.
 - The skeleton always comes from a game actor. A replaced head keeps the face shapes it has keys
   for; normal changes of the shapes are not stored (the game's own heads have none either).
 - Lip-sync is imported onto the face; writing new lip-sync clips is not supported yet.
@@ -121,9 +123,17 @@ BLENDER=/path/to/blender.exe tools/build_release.sh   # dist/risen_impexp-<versi
 For development, junction `addon/risen_impexp` into Blender's add-ons folder; the add-on then finds
 `core/target/release/risen-core.exe` on its own. Tests: `RISEN_GAME="C:\...\Risen" cargo test --release`.
 
-## Legal
+## License
 
-Risen is © Piranha Bytes / Deep Silver. This add-on ships no game data; it reads the game you own.
+Copyright © 2026 UniLinkIF. Risen ImpExp is free software under the **GNU GPL 3.0 or later** (`LICENSE`) **with
+additional terms** under its section 7 (`NOTICE`), which go with every copy and every modified version:
 
-License: GPL-3.0-or-later (see `LICENSE`).
+- **Attribution:** keep `NOTICE`, the copyright line and the attribution "Risen ImpExp by UniLinkIF" with the link to
+  this repository (in the add-on's preferences and in the documentation).
+- **Origin:** a modified version must say it is modified and by whom, carry a different name and version, and must
+  not be presented as the original or as made or endorsed by UniLinkIF.
+- **Names:** no rights to the names "Risen ImpExp" or "UniLinkIF" for forks, products or publicity.
+
+Risen is © Piranha Bytes / Deep Silver. This add-on ships no game data and is not affiliated with them; it reads the
+game you own.
 

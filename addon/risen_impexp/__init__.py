@@ -7,12 +7,14 @@ skeleton and animation work.
 
 Works both as a legacy add-on (bl_info) and as a Blender 5.x extension
 (blender_manifest.toml).
+
+Copyright (C) 2026 UniLinkIF. GPL-3.0-or-later with additional terms (section 7): see NOTICE.
 """
 
 bl_info = {
     "name": "Risen ImpExp",
-    "author": "BlenderMod",
-    "version": (0, 9, 4),
+    "author": "UniLinkIF",
+    "version": (0, 9, 5),
     "blender": (5, 1, 0),
     "location": "File > Import / Export > Risen",
     "description": "Import and export Risen 1 models, actors, motions, lip-sync, collision and ground",

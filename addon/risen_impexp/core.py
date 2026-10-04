@@ -22,6 +22,9 @@ class CoreError(RuntimeError):
 def exe():
     p = prefs().core_exe
     if p:
+        # Never start anything else from here (a game exe picked by mistake would launch the game).
+        if os.path.basename(p).lower() != "risen-core.exe":
+            raise CoreError(f"Ядро має бути risen-core.exe, а вказано {os.path.basename(p)} — очистіть поле в налаштуваннях аддона")
         if not os.path.isfile(p):
             raise CoreError(f"risen-core.exe не знайдено: {p}")
         return p

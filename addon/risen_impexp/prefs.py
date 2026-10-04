@@ -53,7 +53,7 @@ class RisenImpExpPreferences(bpy.types.AddonPreferences):
     )
     core_exe: StringProperty(
         name="Ядро (risen-core.exe)",
-        description="Нативне ядро, що читає й пише формати Risen",
+        description="Порожньо — ядро, що йде з аддоном. Лише risen-core.exe: інші програми аддон не запускає",
         subtype="FILE_PATH",
     )
     cache_dir: StringProperty(
@@ -73,6 +73,9 @@ class RisenImpExpPreferences(bpy.types.AddonPreferences):
 
     def draw(self, context):
         col = self.layout.column()
+        about = col.box()
+        about.label(text="Risen ImpExp by UniLinkIF — GPL-3.0-or-later with additional terms (NOTICE)", icon="INFO")
+        about.operator("wm.url_open", text="github.com/UniLinkIF/risen-impexp", icon="URL").url = "https://github.com/UniLinkIF/risen-impexp"
         col.prop(self, "game_dir")
         col.prop(self, "core_exe")
         col.prop(self, "cache_dir")

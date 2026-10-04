@@ -1,10 +1,10 @@
 schema_version = "1.0.0"
 
 id = "risen_impexp"
-version = "0.9.4"
+version = "0.9.5"
 name = "Risen ImpExp"
 tagline = "Risen 1 models, actors, motions, collision and ground"
-maintainer = "BlenderMod"
+maintainer = "UniLinkIF"
 type = "add-on"
 
 blender_version_min = "5.1.0"

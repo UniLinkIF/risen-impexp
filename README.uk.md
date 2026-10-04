@@ -48,7 +48,7 @@ Bytes, 2009, рушій Genome) у **Blender 5.1+**.
 ## Встановлення
 
 1. Blender 5.1 або новіший.
-2. *Edit → Preferences → Get Extensions → ⌄ → Install from Disk…* → `risen_impexp-0.9.4.zip`
+2. *Edit → Preferences → Get Extensions → ⌄ → Install from Disk…* → `risen_impexp-0.9.5.zip`
    (зі сторінки Releases).
 3. У налаштуваннях аддона вкажіть **Risen game folder** (ту, де лежить `bin\Risen.exe`; шлях Steam
    уже підставлено). За бажанням — папку кешу й папку для пакетів модів.
@@ -122,8 +122,15 @@ BLENDER=/path/to/blender.exe tools/build_release.sh   # dist/risen_impexp-<ве�
 Для розробки зробіть junction `addon/risen_impexp` у папку аддонів Blender; аддон сам знайде
 `core/target/release/risen-core.exe`. Тести: `RISEN_GAME="C:\...\Risen" cargo test --release`.
 
-## Правове
+## Ліцензія
 
-Risen — © Piranha Bytes / Deep Silver. Аддон не містить даних гри; він читає гру, яку ви маєте.
+Copyright © 2026 UniLinkIF. Risen ImpExp — вільне ПЗ за **GNU GPL 3.0 або новішою** (`LICENSE`) **з додатковими
+умовами** за її розділом 7 (`NOTICE`), що йдуть із кожною копією й кожною зміненою версією:
 
-Ліцензія: GPL-3.0-or-later (див. `LICENSE`).
+- **Авторство:** зберігати `NOTICE`, рядок авторських прав і підпис «Risen ImpExp by UniLinkIF» з посиланням на цей
+  репозиторій (у налаштуваннях аддона й у документації).
+- **Походження:** змінена версія мусить казати, що вона змінена й ким, мати іншу назву й версію і не видавати себе за
+  оригінал чи за зроблену або схвалену UniLinkIF.
+- **Назви:** жодних прав на назви «Risen ImpExp» чи «UniLinkIF» для форків, продуктів чи реклами.
+
+Risen — © Piranha Bytes / Deep Silver. Аддон не містить даних гри й не пов'язаний з ними; він читає гру, яку ви маєте.

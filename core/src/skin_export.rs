@@ -291,7 +291,10 @@ pub fn build(g: &crate::game::GameCtx, spec: &ActorSpec) -> Result<(ActorReport,
         if base_names.contains(&name.to_lowercase()) { notes.push(format!("{name}: kept")); mats.push(NewMaterial { name, diffuse: None, normal: None, specular: None }); continue; }
         // Texture names follow a game material template (its stem length), and that template is
         // written as the material's ._xmat too, so the shader knows alpha test and specular.
-        let t = if m.alpha_test.is_some() { &crate::export::ALPHA_TEST } else if m.specular.is_some() { &crate::export::OPAQUE_SPECULAR } else { &crate::export::OPAQUE };
+        // Skinned meshes need a skinned shader: the hero's cloth (alpha test) or the hero's hands (specular). The opaque
+        // template is a weapon's static shader, on which a body does not move; a missing specular or normal map is
+        // written flat instead.
+        let t = if m.alpha_test.is_some() { &crate::export::ALPHA_TEST } else { &crate::export::OPAQUE_SPECULAR };
         let stem = crate::export::stem_for(&crate::export::material_key(&name, &[&m.diffuse, &m.normal, &m.specular]), t.stem.len());
         let mut tex = |png: &Option<String>, suffix: &str, kind: u8| -> Result<Option<String>> {
             let Some(p) = png else { return Ok(None) };
@@ -304,6 +307,14 @@ pub fn build(g: &crate::game::GameCtx, spec: &ActorSpec) -> Result<(ActorReport,
         let diffuse = tex(&m.diffuse, t.diffuse, 2)?;
         let normal = tex(&m.normal, t.normal, 5)?;
         let specular = match t.specular { Some(sfx) => tex(&m.specular, sfx, 3)?, None => None };
+        if normal.is_none() {
+            let tname = format!("{stem}{}", t.normal);
+            files.push((format!("data/compiled/images/BlenderMod/{tname}._ximg"), crate::ximg_write::write(&crate::ximg_write::to_dxt5nm(&[128, 128, 255, 255].repeat(16)), 4, 4, crate::ximg_write::Kind::Dxt5, now)?));
+        }
+        if let (Some(sfx), None) = (t.specular, &specular) {
+            let tname = format!("{stem}{sfx}");
+            files.push((format!("data/compiled/images/BlenderMod/{tname}._ximg"), crate::ximg_write::write(&[24, 24, 24, 255].repeat(16), 4, 4, crate::ximg_write::Kind::Dxt1, now)?));
+        }
         let mat_name = format!("{stem}{}", t.diffuse);
         files.push((format!("data/common/materials/{mat_name}._xmat"), crate::export::material_from_template(g, t, &stem, m.alpha_test)?));
         notes.push(format!("{name}: new {mat_name}{}", if diffuse.is_none() { " (no Base Color image: untextured)" } else { "" }));
